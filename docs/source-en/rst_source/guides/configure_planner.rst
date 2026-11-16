@@ -382,6 +382,47 @@ The ``api`` planner attaches MCP servers through Pydantic AI's MCP client,
 installed by the ``pydantic-ai-slim[mcp]`` extra, which RPent lists by default.
 A run that attaches no MCP server never loads it.
 
+Background scene narration
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A site config ``narration`` section gives every robot two read-only tools,
+``narration_start`` and ``narration_stop``. After the planner calls
+``narration_start``, a background thread checks the run's observation steps
+and describes each new camera frame with its own vision-model request, then
+sends the text to an MCP ``synthesize`` tool such as the speech service in
+``toolkit/narration``. The tool returns immediately, so the planner keeps using
+its other tools while narration runs. The planner's conversation is unchanged
+and it does not receive the descriptions. Narration stops when the planner
+calls ``narration_stop`` or the task ends; sentences already described are
+still synthesized.
+
+.. code-block:: yaml
+
+   mcp_servers:
+     tts:
+       url: http://127.0.0.1:8766/mcp   # no planner_tools: used only by narration
+   narration:
+     tts_server: tts
+     model: deepseek-flash
+     base_url: https://api.deepseek.com
+     api_key: ${oc.env:NARRATION_API_KEY}
+
+Optional fields: ``cameras`` (image artifact names in preference order,
+default ``[agentview_high.png, agentview.png]``), ``interval_s`` (default 2,
+between 0.5 and 60), ``max_chars`` (default 20), ``prompt`` (``{max_chars}`` is
+substituted), ``max_tokens``, ``request_timeout_s``, ``synthesis_timeout_s``,
+``max_queue``, and ``drain_timeout_s``. The model must accept image input
+through an OpenAI-compatible chat completions API. ``narration_start`` accepts
+``interval_s`` and ``focus`` to adjust a running narration.
+
+Robots record an observation after each action, so a long action produces one
+frame and one sentence; ``interval_s`` bounds how often a new frame is checked,
+not how often speech is produced. Descriptions are synthesized in order. Each
+result or error is appended to ``narration.jsonl`` in the run output directory;
+a failed description or synthesis is skipped and never interrupts the task.
+Narration requests share any rate limit of their API key, so use a separate key
+or a longer interval when the planner uses the same service.
+
 .. _planner-check:
 
 Verify Your Configuration

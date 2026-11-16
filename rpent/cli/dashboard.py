@@ -36,6 +36,7 @@ from rpent.cli.main import (
 from rpent.dashboard.events import RunStartedEvent
 from rpent.evaluation import RunFinalizationContext
 from rpent.memory import MemoryManager
+from rpent.narration import narration_session
 from rpent.planner.base import build_planner, is_recoverable_agent_error
 from rpent.robots import get_toolkit
 from rpent.session.planner_capture import end_planner_task, start_planner_task
@@ -348,13 +349,19 @@ def _run_dashboard_task(
                         no_images=args.no_images,
                         mcp_servers=run_config.mcp_servers,
                     )
-                    result = planner.solve(
-                        system_prompt=system_prompt,
-                        user_message=session_message,
+                    with narration_session(
+                        getattr(task_args, "site_narration", None),
                         toolkit=toolkit,
-                        max_turns=args.max_turns,
-                        dashboard_interaction=state,
-                    )
+                        mcp_servers=run_config.mcp_servers,
+                        output_dir=state_output_dir,
+                    ):
+                        result = planner.solve(
+                            system_prompt=system_prompt,
+                            user_message=session_message,
+                            toolkit=toolkit,
+                            max_turns=args.max_turns,
+                            dashboard_interaction=state,
+                        )
                     finish_result = result.finish_result
                     messages += result.messages
                     stats = result.stats

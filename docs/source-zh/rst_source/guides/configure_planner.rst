@@ -256,6 +256,26 @@ CLI 会把站点服务合并进每次运行，对所有 robot 生效，无需改
 
 ``api`` 规划器通过 Pydantic AI 的 MCP 客户端接入 MCP 服务，该客户端由 ``pydantic-ai-slim[mcp]`` extra 安装，RPent 默认列出该 extra。未接入任何 MCP 服务的运行不会加载它。
 
+后台场景播报
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+在站点配置中加入 ``narration`` 段后，每个机器人都会多出两个只读工具：``narration_start`` 和 ``narration_stop``。规划器调用 ``narration_start`` 后，后台线程会检查本次运行的观测步骤，每出现一帧新的相机画面，就单独请求一次视觉模型生成描述，再把文字交给一个 MCP ``synthesize`` 工具（例如 ``toolkit/narration`` 中的语音服务）。该工具会立即返回，播报进行期间规划器可以继续调用其他工具。规划器的对话不受影响，也不会收到这些描述。规划器调用 ``narration_stop`` 或任务结束时播报停止，已经生成的描述仍会合成语音。
+
+.. code-block:: yaml
+
+   mcp_servers:
+     tts:
+       url: http://127.0.0.1:8766/mcp   # 不写 planner_tools：只供播报使用
+   narration:
+     tts_server: tts
+     model: deepseek-flash
+     base_url: https://api.deepseek.com
+     api_key: ${oc.env:NARRATION_API_KEY}
+
+可选字段：``cameras``（按优先顺序排列的图像产物名，默认 ``[agentview_high.png, agentview.png]``）、``interval_s``（默认 2，取值 0.5 到 60）、``max_chars``（默认 20）、``prompt``（其中的 ``{max_chars}`` 会被替换）、``max_tokens``、``request_timeout_s``、``synthesis_timeout_s``、``max_queue`` 和 ``drain_timeout_s``。模型必须能通过 OpenAI 兼容的 chat completions 接口接收图像。``narration_start`` 接受 ``interval_s`` 和 ``focus`` 参数，用于调整正在进行的播报。
+
+机器人在每个动作结束后记录一次观测，所以一个耗时较长的动作只会产生一帧画面和一句描述。``interval_s`` 限制的是检查新画面的频率，而不是生成语音的频率。描述按顺序合成。每条结果或错误都会追加到运行输出目录下的 ``narration.jsonl``；描述或合成失败时跳过该帧，不会中断任务。播报请求与规划器共用同一个 API key 时会共享其限流额度，此时请使用单独的 key 或更长的间隔。
+
 .. _planner-check:
 
 验证你的配置

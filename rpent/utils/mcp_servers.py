@@ -152,8 +152,30 @@ def load_site_mcp_servers(
         ValueError: If the file is missing, unreadable, not a mapping, or the
             section is malformed.
     """
+    return parse_mcp_servers(load_site_section(path, "mcp_servers"))
+
+
+def load_site_section(path: str | Path | None, section: str) -> Any:
+    """Read one top-level section of a site config with interpolation resolved.
+
+    Only the requested section is resolved, so other sections may keep
+    references to unset environment variables.
+
+    Args:
+        path: Path to the site config, or ``None`` when ``--site-config`` was
+            not passed.
+        section: Top-level key to read.
+
+    Returns:
+        The section as plain Python containers, or ``None`` when no path is
+        given or the file has no such section.
+
+    Raises:
+        ValueError: If the file is missing, unreadable, not a mapping, or the
+            section cannot be resolved.
+    """
     if path is None:
-        return ()
+        return None
     config_path = Path(path).expanduser()
     if not config_path.is_file():
         raise ValueError(f"site config not found: {config_path}")
@@ -166,12 +188,11 @@ def load_site_mcp_servers(
         raise ValueError(f"invalid site config {config_path}: {exc}") from exc
     if not isinstance(config, DictConfig):
         raise ValueError(f"site config must be a mapping: {config_path}")
-    section = config.get("mcp_servers")
+    value = config.get(section)
     try:
-        raw = None if section is None else OmegaConf.to_container(section, resolve=True)
+        return None if value is None else OmegaConf.to_container(value, resolve=True)
     except Exception as exc:
         raise ValueError(f"invalid site config {config_path}: {exc}") from exc
-    return parse_mcp_servers(raw)
 
 
 def merge_mcp_servers(
