@@ -70,12 +70,6 @@ logger = get_logger("claude")
 
 _MAX_STREAM_BUFFER_BYTES = 8 * 1024 * 1024
 
-#: Subagent that describes camera frames and speaks them; see ``narrator_model``.
-SCENE_NARRATOR = "scene_narrator"
-#: Built-in Claude Code tool the main agent uses to launch subagents.
-AGENT_TOOL = "Agent"
-_NARRATOR_READS = ("view_env_state", "read_image")
-_NARRATOR_MAX_TURNS = 6
 
 # ---------------------------------------------------------------------------
 # Public backend
@@ -407,12 +401,13 @@ class ClaudeCodePlanner(Planner):
             narrator = _scene_narrator_agent(
                 sdk,
                 toolkit=toolkit,
-                servers=external_servers,
+                servers=self._mcp_servers,
                 model=self._narrator_model,
             )
-            agents = {SCENE_NARRATOR: narrator}
-            builtins.append(AGENT_TOOL)
-            allowed.append(AGENT_TOOL)
+            agents = {"scene_narrator": narrator}
+            # Built-in tool the main agent uses to launch subagents.
+            builtins.append("Agent")
+            allowed.append("Agent")
 
         thinking = {"type": "disabled"} if self._reasoning_effort == "none" else None
         effort = None if self._reasoning_effort == "none" else self._reasoning_effort
@@ -876,7 +871,11 @@ class _Recorder:
 
 
 def _scene_narrator_agent(
-    sdk: Any, *, toolkit: Toolkit, servers: dict[str, Any], model: str
+    sdk: Any,
+    *,
+    toolkit: Toolkit,
+    servers: tuple[McpServerSpec, ...],
+    model: str,
 ) -> Any:
     """Define a read-only subagent that narrates the camera view aloud.
 
@@ -888,13 +887,24 @@ def _scene_narrator_agent(
         ValueError: If the toolkit has no observation tool or no attached
             external MCP server exposes ``synthesize``.
     """
+    from rpent.utils.mcp_servers import ALL_TOOLS
+
     names = {declaration.name for declaration in toolkit.list_tools()}
-    observe = [add_mcp_prefix(name) for name in _NARRATOR_READS if name in names]
+    observe = [
+        add_mcp_prefix(name)
+        for name in ("view_env_state", "read_image")
+        if name in names
+    ]
     if not observe:
         raise ValueError(
             "the scene_narrator subagent needs a view_env_state or read_image tool"
         )
-    speak = [f"mcp__{server}__synthesize" for server in servers]
+    speak = [
+        f"mcp__{server.name}__synthesize"
+        for server in servers
+        if server.planner_tools == ALL_TOOLS
+        or (server.planner_tools and "synthesize" in server.planner_tools)
+    ]
     if not speak:
         raise ValueError(
             "the scene_narrator subagent needs an external MCP server listing "
@@ -917,7 +927,7 @@ def _scene_narrator_agent(
         ),
         tools=observe + speak,
         model=model,
-        maxTurns=_NARRATOR_MAX_TURNS,
+        maxTurns=6,
         background=True,
     )
 

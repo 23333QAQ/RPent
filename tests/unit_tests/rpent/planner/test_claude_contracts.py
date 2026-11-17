@@ -325,10 +325,37 @@ def test_without_narrator_model_options_are_unchanged(tmp_path: Path) -> None:
     assert "Agent" not in options.allowed_tools
 
 
+def test_narrator_speaks_only_through_servers_offering_synthesize(
+    tmp_path: Path,
+) -> None:
+    lights = McpServerSpec(
+        name="lights", url="http://127.0.0.1:1/mcp", planner_tools=("dim",)
+    )
+    voice = McpServerSpec(name="voice", url="http://127.0.0.1:2/mcp", planner_tools="*")
+    planner = narrator_planner(
+        tmp_path, mcp_servers=(lights, TTS, voice), narrator_model="haiku"
+    )
+
+    options = planner._build_options(
+        claude_agent_sdk, toolkit=ObservingToolkit(), max_turns=4
+    )
+
+    assert options.agents["scene_narrator"].tools == [
+        "mcp__rpent__view_env_state",
+        "mcp__tts__synthesize",
+        "mcp__voice__synthesize",
+    ]
+
+
 @pytest.mark.parametrize(
     ("servers", "toolkit", "message"),
     [
         ((), ObservingToolkit(), "synthesize under planner_tools"),
+        (
+            (McpServerSpec(name="dock", url="http://127.0.0.1:1/mcp"),),
+            ObservingToolkit(),
+            "synthesize under planner_tools",
+        ),
         ((TTS,), FakeToolkit(), "view_env_state or read_image"),
     ],
 )
