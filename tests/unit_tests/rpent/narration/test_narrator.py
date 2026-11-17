@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.narration import narration_session
+from rpent.narration import attach_narration
 from rpent.narration.config import NarrationConfig
 from rpent.narration.narrator import LOG_NAME, Narrator
 from rpent.session import EnvState
@@ -259,14 +259,37 @@ class MinimalToolkit(Toolkit):
         pass
 
 
-def test_session_without_config_adds_no_tools(state, tmp_path):
+def test_attach_without_config_adds_no_tools(state, tmp_path):
     toolkit = MinimalToolkit(state)
 
-    with narration_session(None, toolkit=toolkit, mcp_servers=(), output_dir=tmp_path):
-        assert toolkit.list_tools() == ()
+    narrator = attach_narration(
+        None, toolkit=toolkit, mcp_servers=(), output_dir=tmp_path
+    )
+
+    assert narrator is None
+    assert toolkit.list_tools() == ()
 
 
-def test_session_tools_control_narration_without_blocking(state, tmp_path, monkeypatch):
+def test_toolkit_close_runs_callbacks_before_draining(state, caplog):
+    toolkit = MinimalToolkit(state)
+    calls = []
+
+    def failing() -> None:
+        calls.append("failing")
+        raise RuntimeError("boom")
+
+    toolkit.on_close(failing)
+    toolkit.on_close(lambda: calls.append("second"))
+    toolkit.close()
+    toolkit.close()
+
+    assert calls == ["failing", "second"]
+    assert "toolkit close callback failed" in caplog.text
+
+
+def test_attached_tools_control_narration_until_toolkit_closes(
+    state, tmp_path, monkeypatch
+):
     import rpent.narration as narration_module
     import rpent.narration.describer as describer_module
     import rpent.narration.speaker as speaker_module
@@ -287,18 +310,20 @@ def test_session_tools_control_narration_without_blocking(state, tmp_path, monke
     toolkit = MinimalToolkit(state)
     add_frame(state)
 
-    with narration_session(
+    narrator = attach_narration(
         site, toolkit=toolkit, mcp_servers=(server,), output_dir=tmp_path
-    ) as narrator:
-        tools = {tool.name: tool for tool in toolkit.list_tools()}
-        assert set(tools) == {"narration_start", "narration_stop"}
-        assert all(tool.readonly for tool in tools.values())
+    )
+    tools = {tool.name: tool for tool in toolkit.list_tools()}
+    assert set(tools) == {"narration_start", "narration_stop"}
+    assert all(tool.readonly for tool in tools.values())
 
-        result = toolkit.execute_tool("narration_start", {"focus": "gripper"})
-        assert result.data["status"] == "running"
-        wait_until(lambda: len(synthesizer.texts) == 1)
-        assert toolkit.execute_tool("narration_start", {"interval_s": 0.1}).is_error
-        assert toolkit.execute_tool("narration_stop", {}).data["status"] == "stopping"
+    result = toolkit.execute_tool("narration_start", {"focus": "gripper"})
+    assert result.data["status"] == "running"
+    wait_until(lambda: len(synthesizer.texts) == 1)
+    assert toolkit.execute_tool("narration_start", {"interval_s": 0.1}).is_error
+    assert narrator.running
+
+    toolkit.close()  # The planner never called narration_stop.
 
     assert not narrator.running
     assert describer.calls[0][1] == "gripper"

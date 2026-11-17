@@ -55,7 +55,7 @@ from rpent.dashboard.events import (
 )
 from rpent.evaluation import RunFinalizationContext
 from rpent.memory import MemoryManager
-from rpent.narration import narration_session
+from rpent.narration import attach_narration
 from rpent.planner.base import (
     REASONING_EFFORTS,
     build_planner,
@@ -692,25 +692,25 @@ def main() -> int:
             finish_result = None
             environment_success = None
             try:
+                attach_narration(
+                    args.site_config,
+                    toolkit=toolkit,
+                    mcp_servers=run_config.mcp_servers,
+                    output_dir=state_output_dir,
+                )
                 if args.record_trajectory and args.planner != "flash":
                     task_state = start_planner_task(
                         toolkit.state,
                         instruction=session_msg,
                         config={"arguments": vars(args), "run": asdict(run_config)},
                     )
-                with narration_session(
-                    args.site_config,
+                result = planner.solve(
+                    system_prompt=system_prompt,
+                    user_message=session_msg,
                     toolkit=toolkit,
-                    mcp_servers=run_config.mcp_servers,
-                    output_dir=state_output_dir,
-                ):
-                    result = planner.solve(
-                        system_prompt=system_prompt,
-                        user_message=session_msg,
-                        toolkit=toolkit,
-                        max_turns=args.max_turns,
-                        input_queue=input_queue,
-                    )
+                    max_turns=args.max_turns,
+                    input_queue=input_queue,
+                )
                 finish_result = result.finish_result
                 messages += result.messages
                 stats = result.stats

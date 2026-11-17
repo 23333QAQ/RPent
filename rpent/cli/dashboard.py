@@ -36,7 +36,7 @@ from rpent.cli.main import (
 from rpent.dashboard.events import RunStartedEvent
 from rpent.evaluation import RunFinalizationContext
 from rpent.memory import MemoryManager
-from rpent.narration import narration_session
+from rpent.narration import attach_narration
 from rpent.planner.base import build_planner, is_recoverable_agent_error
 from rpent.robots import get_toolkit
 from rpent.session.planner_capture import end_planner_task, start_planner_task
@@ -324,6 +324,12 @@ def _run_dashboard_task(
                 finish_result = None
                 environment_success = None
                 try:
+                    attach_narration(
+                        args.site_config,
+                        toolkit=toolkit,
+                        mcp_servers=run_config.mcp_servers,
+                        output_dir=state_output_dir,
+                    )
                     if task_args.record_trajectory and task_args.planner != "flash":
                         task_state = start_planner_task(
                             toolkit.state,
@@ -349,19 +355,13 @@ def _run_dashboard_task(
                         no_images=args.no_images,
                         mcp_servers=run_config.mcp_servers,
                     )
-                    with narration_session(
-                        args.site_config,
+                    result = planner.solve(
+                        system_prompt=system_prompt,
+                        user_message=session_message,
                         toolkit=toolkit,
-                        mcp_servers=run_config.mcp_servers,
-                        output_dir=state_output_dir,
-                    ):
-                        result = planner.solve(
-                            system_prompt=system_prompt,
-                            user_message=session_message,
-                            toolkit=toolkit,
-                            max_turns=args.max_turns,
-                            dashboard_interaction=state,
-                        )
+                        max_turns=args.max_turns,
+                        dashboard_interaction=state,
+                    )
                     finish_result = result.finish_result
                     messages += result.messages
                     stats = result.stats

@@ -25,7 +25,7 @@ import json
 import threading
 import time
 import traceback
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -154,6 +154,7 @@ class Toolkit:
         self._state = state
         self._memory = memory
         self._scheduler = _Scheduler()
+        self._close_callbacks: list[Callable[[], None]] = []
         self._register_common_tools()
 
     # ------------------------------------------------------------------
@@ -400,8 +401,22 @@ class Toolkit:
             if any(call.cancel_event.is_set() for call in self._scheduler.active):
                 raise ToolCancelled("tool operation interrupted")
 
+    def on_close(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` when the toolkit closes, before robot resources go.
+
+        Callbacks run in registration order at the start of :meth:`close`;
+        one that raises is logged and does not prevent the others or the drain.
+        """
+        self._close_callbacks.append(callback)
+
     def close(self) -> None:
         """Close admission and drain calls before subclasses release resources."""
+        callbacks, self._close_callbacks = self._close_callbacks, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.exception("toolkit close callback failed")
         self._scheduler.cancel(close=True)
         self.cancel_active_and_wait()
 

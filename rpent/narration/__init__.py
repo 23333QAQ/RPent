@@ -23,8 +23,6 @@ conversation, model, and tool scheduling are unchanged.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,24 +39,25 @@ if TYPE_CHECKING:
 
 __all__ = [
     "NarrationConfig",
+    "attach_narration",
     "load_narration_config",
-    "narration_session",
     "resolve_tts_server",
 ]
 
 
-@contextmanager
-def narration_session(
+def attach_narration(
     site_config: str | Path | None,
     *,
     toolkit: Toolkit,
     mcp_servers: tuple[McpServerSpec, ...],
     output_dir: str | Path,
-) -> Iterator[Narrator | None]:
+) -> Narrator | None:
     """Register narration tools on ``toolkit`` for one planner run.
 
-    Narration itself starts only when the planner calls ``narration_start``.
-    On exit any active narration is stopped and its queue drained.
+    Call before the planner starts so the tools are listed. Narration itself
+    starts only when the planner calls ``narration_start``. Closing the
+    toolkit stops any active narration and drains its queue before the
+    robot's resources are released.
 
     Args:
         site_config: Path given by ``--site-config``; without a ``narration``
@@ -67,14 +66,16 @@ def narration_session(
         mcp_servers: Merged robot and site MCP servers.
         output_dir: Directory for ``narration.jsonl``.
 
+    Returns:
+        The narrator, or ``None`` when narration is not configured.
+
     Raises:
         ValueError: If the ``narration`` section is invalid or names an
             undeclared MCP server.
     """
     config = load_narration_config(site_config)
     if config is None:
-        yield None
-        return
+        return None
     from rpent.narration.describer import SceneDescriber
     from rpent.narration.narrator import Narrator
     from rpent.narration.speaker import Speaker
@@ -92,7 +93,5 @@ def narration_session(
         ),
     )
     toolkit.add_tools(iter_tools(NarrationTools(narrator)))
-    try:
-        yield narrator
-    finally:
-        narrator.close()
+    toolkit.on_close(narrator.close)
+    return narrator
