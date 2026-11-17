@@ -130,12 +130,16 @@ Notes:
   `Claude Agent SDK docs
   <https://code.claude.com/docs/en/agent-sdk/overview>`_.
 - Setting ``RPENT_CLAUDE_NARRATOR_MODEL`` (for example ``haiku``) registers a
-  ``scene_narrator`` subagent. The main agent can launch it in the background
-  to describe the latest observation in one sentence and speak it through an
-  external MCP ``synthesize`` tool, so the run needs a server listing
-  ``synthesize`` under ``planner_tools`` (see :ref:`external-mcp-servers`).
-  The subagent can only read observations and call ``synthesize``. It runs
-  only when the main agent launches it, so ask for narration in the task.
+  ``scene_narrator`` subagent. Once the main agent launches it in the
+  background, it repeatedly reads the latest observation, describes it in one
+  sentence, and speaks it through an external MCP ``synthesize`` tool, so the
+  run needs a server listing ``synthesize`` under ``planner_tools`` (see
+  :ref:`external-mcp-servers`). Each round starts after the previous synthesis
+  returns, whether or not the view changed, until the episode reports
+  ``terminated`` or ``truncated`` or the subagent reaches 200 turns. The
+  subagent can only read observations and call ``synthesize``, but it shares
+  the session's ``--claude-code-max-budget-usd``. It runs only when the main
+  agent launches it, so ask for narration in the task.
 
 Local Models with Claude Code
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

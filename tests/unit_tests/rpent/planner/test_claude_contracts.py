@@ -305,7 +305,7 @@ def test_narrator_subagent_is_read_only_and_runs_in_the_background(
     assert narrator.tools == ["mcp__rpent__view_env_state", "mcp__tts__synthesize"]
     assert narrator.model == "haiku"
     assert narrator.background is True
-    assert narrator.maxTurns == 6
+    assert narrator.maxTurns == 200
     # The main agent may launch it; the subagent never gets action tools.
     assert options.tools == ["Read", "Agent"]
     assert "Agent" in options.allowed_tools

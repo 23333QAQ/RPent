@@ -876,11 +876,13 @@ def _scene_narrator_agent(
     servers: tuple[McpServerSpec, ...],
     model: str,
 ) -> Any:
-    """Define a read-only subagent that narrates the camera view aloud.
+    """Define a read-only subagent that keeps narrating the camera view aloud.
 
     The subagent may only read observations and call an external
     ``synthesize`` tool; it never receives robot action tools. It runs in the
-    background so the main agent keeps acting while it narrates.
+    background so the main agent keeps acting while it narrates, starting each
+    round after the previous synthesis returns until the episode ends or its
+    turn limit is reached.
 
     Raises:
         ValueError: If the toolkit has no observation tool or no attached
@@ -911,22 +913,29 @@ def _scene_narrator_agent(
         )
     return sdk.AgentDefinition(
         description=(
-            "Narrates the robot's camera view aloud. Launch it in the background "
-            "when asked to describe or narrate the scene; it reads the latest "
-            "observation, speaks one short Chinese sentence, and reports the "
-            "audio path. It cannot move the robot."
+            "Keeps narrating the robot's camera view aloud until the episode "
+            "ends. Launch it once, in the background, when asked to narrate; "
+            "do not launch a second one while it runs. If it returns before "
+            "the task is finished, launch it again. It cannot move the robot."
         ),
         prompt=(
-            "You narrate a robot's camera view. Read the latest observation with "
-            "view_env_state(step=-1) or read_image, look at agentview_high.png, "
-            "and write one Chinese sentence of at most 20 characters about the "
-            "arm and the main objects, without Markdown. Call synthesize with "
-            "exactly that sentence, then reply with the sentence and audio_path. "
-            "Do not call any other tool."
+            "You narrate a robot's camera view continuously. Repeat this round "
+            "until told to stop:\n"
+            "1. Call view_env_state(step=-1) or read_image for the latest "
+            "observation and look at agentview_high.png.\n"
+            "2. Write one Chinese sentence of at most 20 characters about the "
+            "arm and the main objects, without Markdown. If the view has not "
+            "changed since your last round, describe a different detail.\n"
+            "3. Call synthesize once with exactly that sentence and wait for it "
+            "to return before starting the next round.\n"
+            "Start the next round immediately, whether or not the view changed. "
+            "Stop and reply with a one-line summary only when view_env_state "
+            "reports terminated or truncated as true, or a tool reports that "
+            "the session is closed. Do not call any other tool."
         ),
         tools=observe + speak,
         model=model,
-        maxTurns=6,
+        maxTurns=200,
         background=True,
     )
 
