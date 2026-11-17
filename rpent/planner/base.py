@@ -313,6 +313,7 @@ def build_planner(
             dashboard_events=dashboard_events,
             reasoning_effort=reasoning_effort,
             mcp_servers=planner_servers,
+            narrator_model=os.environ.get("RPENT_CLAUDE_NARRATOR_MODEL") or None,
         )
     if planner_type == "codex":
         from rpent.planner.codex import CodexPlanner

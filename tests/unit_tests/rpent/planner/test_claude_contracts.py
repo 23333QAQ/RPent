@@ -262,6 +262,104 @@ def test_options_attach_external_mcp_servers(
     assert "mcp__dock" not in options["allowed_tools"]
 
 
+class ObservingToolkit(FakeToolkit):
+    @tool(readonly=True)
+    def view_env_state(self, step: int = -1) -> ToolResult:
+        """Read one recorded state."""
+        return ToolResult(data={"step": step})
+
+    @tool
+    def move_to(self, x: float) -> ToolResult:
+        """Move the arm."""
+        return ToolResult(data={"x": x})
+
+    def list_tools(self):
+        return (*super().list_tools(), self.view_env_state, self.move_to)
+
+
+TTS = McpServerSpec(
+    name="tts", url="http://127.0.0.1:8766/mcp", planner_tools=("synthesize",)
+)
+
+
+def narrator_planner(tmp_path: Path, **kwargs: Any) -> ClaudeCodePlanner:
+    return ClaudeCodePlanner(
+        output_dir=str(tmp_path),
+        repo_root=tmp_path,
+        allowed_tools="Read",
+        dashboard_events=RecordingSink(),
+        **kwargs,
+    )
+
+
+def test_narrator_subagent_is_read_only_and_runs_in_the_background(
+    tmp_path: Path,
+) -> None:
+    planner = narrator_planner(tmp_path, mcp_servers=(TTS,), narrator_model="haiku")
+
+    options = planner._build_options(
+        claude_agent_sdk, toolkit=ObservingToolkit(), max_turns=4
+    )
+
+    narrator = options.agents["scene_narrator"]
+    assert narrator.tools == ["mcp__rpent__view_env_state", "mcp__tts__synthesize"]
+    assert narrator.model == "haiku"
+    assert narrator.background is True
+    assert narrator.maxTurns == 6
+    # The main agent may launch it; the subagent never gets action tools.
+    assert options.tools == ["Read", "Agent"]
+    assert "Agent" in options.allowed_tools
+    assert "mcp__rpent__move_to" in options.allowed_tools
+    assert "mcp__rpent__move_to" not in narrator.tools
+
+
+def test_without_narrator_model_options_are_unchanged(tmp_path: Path) -> None:
+    planner = narrator_planner(tmp_path, mcp_servers=(TTS,))
+
+    options = planner._build_options(
+        claude_agent_sdk, toolkit=ObservingToolkit(), max_turns=4
+    )
+
+    assert options.agents is None
+    assert options.tools == ["Read"]
+    assert "Agent" not in options.allowed_tools
+
+
+@pytest.mark.parametrize(
+    ("servers", "toolkit", "message"),
+    [
+        ((), ObservingToolkit(), "synthesize under planner_tools"),
+        ((TTS,), FakeToolkit(), "view_env_state or read_image"),
+    ],
+)
+def test_narrator_requires_observation_and_speech_tools(
+    tmp_path: Path, servers, toolkit, message
+) -> None:
+    planner = narrator_planner(tmp_path, mcp_servers=servers, narrator_model="haiku")
+
+    with pytest.raises(ValueError, match=message):
+        planner._build_options(claude_agent_sdk, toolkit=toolkit, max_turns=4)
+
+
+def test_build_planner_reads_narrator_model_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpent.planner.base import build_planner
+
+    monkeypatch.setenv("RPENT_CLAUDE_NARRATOR_MODEL", "haiku")
+
+    planner = build_planner(
+        "claude_code",
+        output_dir=tmp_path,
+        recipe_tag="t",
+        robot_name="libero",
+        memory_dir=tmp_path / "memory",
+        dashboard_events=RecordingSink(),
+    )
+
+    assert planner._narrator_model == "haiku"
+
+
 def test_in_process_mcp_bridge_maps_schema_dispatch_and_errors() -> None:
     toolkit = FakeToolkit({"error": "rejected"}, images=[b"contract-image"])
     fake_sdk = FakeSdkTools()

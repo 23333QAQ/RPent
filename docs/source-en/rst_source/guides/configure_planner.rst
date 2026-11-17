@@ -129,6 +129,13 @@ Notes:
   Authentication normally uses ``ANTHROPIC_API_KEY``. See the
   `Claude Agent SDK docs
   <https://code.claude.com/docs/en/agent-sdk/overview>`_.
+- Setting ``RPENT_CLAUDE_NARRATOR_MODEL`` (for example ``haiku``) registers a
+  ``scene_narrator`` subagent. The main agent can launch it in the background
+  to describe the latest observation in one sentence and speak it through an
+  external MCP ``synthesize`` tool, so the run needs a server listing
+  ``synthesize`` under ``planner_tools`` (see :ref:`external-mcp-servers`).
+  The subagent can only read observations and call ``synthesize``. It runs
+  only when the main agent launches it, so ask for narration in the task.
 
 Local Models with Claude Code
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

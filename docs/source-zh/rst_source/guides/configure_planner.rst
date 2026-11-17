@@ -98,6 +98,7 @@ RPent 为 Claude 规划会话关闭文件系统配置来源，因此不会自动
 - 非交互运行受 ``--planner-timeout-s`` 限制；默认读取 ``CELL_TIMEOUT_S``，未设置时为 ``1200`` 秒。``--tui`` 模式不应用这一时限。
 - 通过 ``--claude-code-max-budget-usd`` 设置美元预算（默认取 ``MAX_BUDGET_USD`` 环境变量或 ``10``）。
 - RPent 的依赖中已包含 Claude Agent SDK；该 SDK 自带 Claude Code 二进制文件，无需单独安装 CLI。认证通常使用 ``ANTHROPIC_API_KEY``，详见 `Claude Agent SDK 文档 <https://code.claude.com/docs/en/agent-sdk/overview>`_。
+- 设置 ``RPENT_CLAUDE_NARRATOR_MODEL``（例如 ``haiku``）后会注册一个 ``scene_narrator`` 子 agent。主 agent 可以在后台启动它，让它用一句话描述最新的观测画面，并通过外部 MCP ``synthesize`` 工具朗读出来，因此本次运行需要一个在 ``planner_tools`` 中列出 ``synthesize`` 的服务（见 :ref:`external-mcp-servers`）。该子 agent 只能读取观测和调用 ``synthesize``。只有主 agent 启动它时才会运行，所以需要在任务中提出播报要求。
 
 通过 Claude Code 使用本地模型
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

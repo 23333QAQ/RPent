@@ -70,6 +70,13 @@ logger = get_logger("claude")
 
 _MAX_STREAM_BUFFER_BYTES = 8 * 1024 * 1024
 
+#: Subagent that describes camera frames and speaks them; see ``narrator_model``.
+SCENE_NARRATOR = "scene_narrator"
+#: Built-in Claude Code tool the main agent uses to launch subagents.
+AGENT_TOOL = "Agent"
+_NARRATOR_READS = ("view_env_state", "read_image")
+_NARRATOR_MAX_TURNS = 6
+
 # ---------------------------------------------------------------------------
 # Public backend
 # ---------------------------------------------------------------------------
@@ -92,8 +99,15 @@ class ClaudeCodePlanner(Planner):
         output_path: str | Path | None = None,
         reasoning_effort: str = "none",
         mcp_servers: tuple["McpServerSpec", ...] = (),
+        narrator_model: str | None = None,
     ):
-        """Initialize the Claude Agent SDK backend."""
+        """Initialize the Claude Agent SDK backend.
+
+        Args:
+            narrator_model: Model for the ``scene_narrator`` subagent, which
+                describes camera frames and speaks them through an external
+                MCP ``synthesize`` tool. ``None`` registers no subagent.
+        """
         self._output_dir = str(output_dir)
         self._repo_root = str(repo_root) if repo_root else str(get_repo_root())
         self._model = model
@@ -104,6 +118,7 @@ class ClaudeCodePlanner(Planner):
         self._output_path = Path(output_path) if output_path else None
         self._dashboard_events = dashboard_events
         self._mcp_servers = mcp_servers
+        self._narrator_model = narrator_model
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         self._reasoning_effort = reasoning_effort
@@ -387,9 +402,22 @@ class ClaudeCodePlanner(Planner):
         external_servers, external_allowed = _external_mcp_config(self._mcp_servers)
         allowed.extend(external_allowed)
 
+        agents = None
+        if self._narrator_model:
+            narrator = _scene_narrator_agent(
+                sdk,
+                toolkit=toolkit,
+                servers=external_servers,
+                model=self._narrator_model,
+            )
+            agents = {SCENE_NARRATOR: narrator}
+            builtins.append(AGENT_TOOL)
+            allowed.append(AGENT_TOOL)
+
         thinking = {"type": "disabled"} if self._reasoning_effort == "none" else None
         effort = None if self._reasoning_effort == "none" else self._reasoning_effort
         return sdk.ClaudeAgentOptions(
+            agents=agents,
             cwd=self._repo_root,
             model=self._model,
             max_turns=max_turns,
@@ -845,6 +873,53 @@ class _Recorder:
 # ---------------------------------------------------------------------------
 # Tool bridge (RPent registry -> SDK MCP server)
 # ---------------------------------------------------------------------------
+
+
+def _scene_narrator_agent(
+    sdk: Any, *, toolkit: Toolkit, servers: dict[str, Any], model: str
+) -> Any:
+    """Define a read-only subagent that narrates the camera view aloud.
+
+    The subagent may only read observations and call an external
+    ``synthesize`` tool; it never receives robot action tools. It runs in the
+    background so the main agent keeps acting while it narrates.
+
+    Raises:
+        ValueError: If the toolkit has no observation tool or no attached
+            external MCP server exposes ``synthesize``.
+    """
+    names = {declaration.name for declaration in toolkit.list_tools()}
+    observe = [add_mcp_prefix(name) for name in _NARRATOR_READS if name in names]
+    if not observe:
+        raise ValueError(
+            "the scene_narrator subagent needs a view_env_state or read_image tool"
+        )
+    speak = [f"mcp__{server}__synthesize" for server in servers]
+    if not speak:
+        raise ValueError(
+            "the scene_narrator subagent needs an external MCP server listing "
+            "synthesize under planner_tools"
+        )
+    return sdk.AgentDefinition(
+        description=(
+            "Narrates the robot's camera view aloud. Launch it in the background "
+            "when asked to describe or narrate the scene; it reads the latest "
+            "observation, speaks one short Chinese sentence, and reports the "
+            "audio path. It cannot move the robot."
+        ),
+        prompt=(
+            "You narrate a robot's camera view. Read the latest observation with "
+            "view_env_state(step=-1) or read_image, look at agentview_high.png, "
+            "and write one Chinese sentence of at most 20 characters about the "
+            "arm and the main objects, without Markdown. Call synthesize with "
+            "exactly that sentence, then reply with the sentence and audio_path. "
+            "Do not call any other tool."
+        ),
+        tools=observe + speak,
+        model=model,
+        maxTurns=_NARRATOR_MAX_TURNS,
+        background=True,
+    )
 
 
 def _external_mcp_config(
