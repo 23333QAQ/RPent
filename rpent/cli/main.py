@@ -55,11 +55,7 @@ from rpent.dashboard.events import (
 )
 from rpent.evaluation import RunFinalizationContext
 from rpent.memory import MemoryManager
-from rpent.narration import (
-    load_narration_config,
-    narration_session,
-    resolve_tts_server,
-)
+from rpent.narration import narration_session
 from rpent.planner.base import (
     REASONING_EFFORTS,
     build_planner,
@@ -209,9 +205,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Deployment-level YAML shared by every robot at this site. Its "
         "mcp_servers section declares facility MCP servers; tools listed "
         "under planner_tools are attached to the selected planner, while "
-        "unlisted tools stay available to the robot's Env/Toolkit layer. "
-        "An optional narration section adds narration_start/narration_stop "
-        "tools that speak scene descriptions in the background.",
+        "unlisted tools stay available to the robot's Env/Toolkit layer.",
     )
 
     # other config
@@ -431,7 +425,6 @@ def main() -> int:
         logger.warning("--interactive is deprecated; use --tui instead")
     try:
         args.site_mcp_servers = load_site_mcp_servers(args.site_config)
-        args.site_narration = load_narration_config(args.site_config)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     human_interactive_exploration = (
@@ -521,8 +514,6 @@ def main() -> int:
         run_config = _with_site_mcp_servers(
             robot_spec.parse_config(args), args.site_mcp_servers
         )
-        if args.site_narration is not None:
-            resolve_tts_server(args.site_narration, run_config.mcp_servers)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     recipe_tag = run_config.recipe_tag
@@ -708,7 +699,7 @@ def main() -> int:
                         config={"arguments": vars(args), "run": asdict(run_config)},
                     )
                 with narration_session(
-                    args.site_narration,
+                    args.site_config,
                     toolkit=toolkit,
                     mcp_servers=run_config.mcp_servers,
                     output_dir=state_output_dir,

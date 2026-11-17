@@ -17,8 +17,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
-
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.planner.base import PlannerResult
 from rpent.robots import PromptBundle, RobotSpec, RunConfig
@@ -112,8 +110,8 @@ def test_planner_receives_narration_tools_from_site_config(monkeypatch, tmp_path
     ]
 
 
-def test_undeclared_tts_server_fails_before_the_run(monkeypatch, tmp_path, capsys):
-    with pytest.raises(SystemExit):
-        _run(monkeypatch, tmp_path, server="lights")
-
-    assert "narration.tts_server 'tts' is not declared" in capsys.readouterr().err
+def test_undeclared_tts_server_ends_the_run_before_the_planner(
+    monkeypatch, tmp_path, caplog
+):
+    assert _run(monkeypatch, tmp_path, server="lights") == []
+    assert "narration.tts_server 'tts' is not declared" in caplog.text

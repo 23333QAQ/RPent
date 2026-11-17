@@ -350,7 +350,7 @@ def _run_dashboard_task(
                         mcp_servers=run_config.mcp_servers,
                     )
                     with narration_session(
-                        getattr(task_args, "site_narration", None),
+                        args.site_config,
                         toolkit=toolkit,
                         mcp_servers=run_config.mcp_servers,
                         output_dir=state_output_dir,

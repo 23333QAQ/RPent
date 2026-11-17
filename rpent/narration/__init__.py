@@ -49,7 +49,7 @@ __all__ = [
 
 @contextmanager
 def narration_session(
-    config: NarrationConfig | None,
+    site_config: str | Path | None,
     *,
     toolkit: Toolkit,
     mcp_servers: tuple[McpServerSpec, ...],
@@ -61,14 +61,17 @@ def narration_session(
     On exit any active narration is stopped and its queue drained.
 
     Args:
-        config: The site ``narration`` section, or ``None`` to do nothing.
+        site_config: Path given by ``--site-config``; without a ``narration``
+            section, or with no path, nothing is registered.
         toolkit: The run's Toolkit; its ``state`` supplies camera frames.
         mcp_servers: Merged robot and site MCP servers.
         output_dir: Directory for ``narration.jsonl``.
 
     Raises:
-        ValueError: If ``config.tts_server`` is not a declared MCP server.
+        ValueError: If the ``narration`` section is invalid or names an
+            undeclared MCP server.
     """
+    config = load_narration_config(site_config)
     if config is None:
         yield None
         return

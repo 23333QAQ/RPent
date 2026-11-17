@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from rpent.utils.mcp_servers import McpServerSpec, load_site_section
+from rpent.utils.mcp_servers import McpServerSpec
 
 #: Bounds for the frame check interval, also enforced on planner overrides.
 MIN_INTERVAL_S = 0.5
@@ -83,8 +83,28 @@ def load_narration_config(path: str | Path | None) -> NarrationConfig | None:
     Raises:
         ValueError: If the site config or its ``narration`` section is invalid.
     """
-    raw = load_site_section(path, "narration")
-    return None if raw is None else parse_narration_config(raw)
+    if path is None:
+        return None
+    config_path = Path(path).expanduser()
+    if not config_path.is_file():
+        raise ValueError(f"site config not found: {config_path}")
+
+    from omegaconf import DictConfig, OmegaConf
+
+    try:
+        config = OmegaConf.load(config_path)
+    except Exception as exc:
+        raise ValueError(f"invalid site config {config_path}: {exc}") from exc
+    if not isinstance(config, DictConfig):
+        raise ValueError(f"site config must be a mapping: {config_path}")
+    section = config.get("narration")
+    if section is None:
+        return None
+    try:
+        raw = OmegaConf.to_container(section, resolve=True)
+    except Exception as exc:
+        raise ValueError(f"invalid site config {config_path}: {exc}") from exc
+    return parse_narration_config(raw)
 
 
 def parse_narration_config(raw: Any) -> NarrationConfig:

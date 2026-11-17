@@ -267,9 +267,16 @@ def test_session_without_config_adds_no_tools(state, tmp_path):
 
 
 def test_session_tools_control_narration_without_blocking(state, tmp_path, monkeypatch):
+    import rpent.narration as narration_module
     import rpent.narration.describer as describer_module
     import rpent.narration.speaker as speaker_module
 
+    site = tmp_path / "site.yaml"
+    monkeypatch.setattr(
+        narration_module,
+        "load_narration_config",
+        lambda path: make_config() if path == site else None,
+    )
     describer, synthesizer = FakeDescriber(), FakeSynthesizer()
     monkeypatch.setattr(describer_module, "SceneDescriber", lambda config: describer)
     monkeypatch.setattr(
@@ -281,7 +288,7 @@ def test_session_tools_control_narration_without_blocking(state, tmp_path, monke
     add_frame(state)
 
     with narration_session(
-        make_config(), toolkit=toolkit, mcp_servers=(server,), output_dir=tmp_path
+        site, toolkit=toolkit, mcp_servers=(server,), output_dir=tmp_path
     ) as narrator:
         tools = {tool.name: tool for tool in toolkit.list_tools()}
         assert set(tools) == {"narration_start", "narration_stop"}
