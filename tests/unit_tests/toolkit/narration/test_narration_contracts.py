@@ -22,7 +22,7 @@ from mcp import types
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from toolkit.narration.server import build_server
-from toolkit.narration.tts_client import decode_audio
+from toolkit.narration.tts_client import EdgeTtsClient, decode_audio
 
 
 def wav_bytes() -> bytes:
@@ -130,3 +130,80 @@ def test_mcp_synthesis_result_or_error(tmp_path, failure):
         for result in saved:
             assert Path(result["audio_path"]).read_bytes() == wav_bytes()
             assert "data" not in result
+
+
+def test_server_saves_mp3_for_a_backend_that_reports_it(tmp_path):
+    """The backend, not the server, decides the file suffix and MIME type."""
+
+    async def synthesize(text):
+        return b"ID3fake-mp3"
+
+    output = tmp_path / "output"
+    server = build_server(
+        output_dir=output,
+        tts=SimpleNamespace(
+            synthesize=synthesize, suffix=".mp3", mime_type="audio/mpeg"
+        ),
+        timeout=5,
+    )
+
+    async def run():
+        async with create_connected_server_and_client_session(
+            server._mcp_server
+        ) as session:
+            return await session.call_tool("synthesize", {"text": "你好"})
+
+    result = asyncio.run(run())
+
+    saved = result.structuredContent
+    assert saved["mime_type"] == "audio/mpeg"
+    assert saved["audio_path"].endswith(".mp3")
+    assert Path(saved["audio_path"]).read_bytes() == b"ID3fake-mp3"
+
+
+def test_edge_client_streams_mp3(monkeypatch):
+    edge_tts = pytest.importorskip("edge_tts")
+    seen = {}
+
+    class FakeCommunicate:
+        def __init__(self, text, voice, **options):
+            seen.update(text=text, voice=voice, **options)
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"ID3"}
+            yield {"type": "WordBoundary", "data": b"ignored"}
+            yield {"type": "audio", "data": b"-rest"}
+
+    monkeypatch.setattr(edge_tts, "Communicate", FakeCommunicate)
+    client = EdgeTtsClient(voice="zh-CN-XiaoyiNeural")
+
+    audio = asyncio.run(client.synthesize("桌上有一个杯子。"))
+
+    assert audio == b"ID3-rest"
+    # Unset options are omitted: edge-tts rejects ``rate=None``.
+    assert seen == {"text": "桌上有一个杯子。", "voice": "zh-CN-XiaoyiNeural"}
+    assert (client.suffix, client.mime_type) == (".mp3", "audio/mpeg")
+
+
+def test_edge_client_reports_failures(monkeypatch):
+    edge_tts = pytest.importorskip("edge_tts")
+
+    class FailingCommunicate:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            raise ConnectionError("no network")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(edge_tts, "Communicate", FailingCommunicate)
+    with pytest.raises(RuntimeError, match="no network"):
+        asyncio.run(EdgeTtsClient(timeout=5).synthesize("你好"))
+
+    class EmptyCommunicate(FailingCommunicate):
+        async def stream(self):
+            yield {"type": "WordBoundary", "data": b""}
+
+    monkeypatch.setattr(edge_tts, "Communicate", EmptyCommunicate)
+    with pytest.raises(RuntimeError, match="no audio"):
+        asyncio.run(EdgeTtsClient(timeout=5).synthesize("你好"))

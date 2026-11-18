@@ -24,7 +24,7 @@ from pydantic import Field
 
 from rpent.utils.logging import get_logger
 
-from .tts_client import OvosTtsClient
+from .tts_client import EdgeTtsClient, OvosTtsClient
 
 logger = get_logger("narration")
 
@@ -53,7 +53,7 @@ def build_server(
                 raise ValueError("text must not be blank")
             started = time.perf_counter()
             audio = await tts.synthesize(text)
-            target = output_dir / f"{uuid4().hex}.wav"
+            target = output_dir / f"{uuid4().hex}{getattr(tts, 'suffix', '.wav')}"
             with target.open("xb") as stream:
                 try:
                     stream.write(audio)
@@ -64,7 +64,7 @@ def build_server(
             return {
                 "text": text,
                 "audio_path": str(target),
-                "mime_type": "audio/wav",
+                "mime_type": getattr(tts, "mime_type", "audio/wav"),
                 "elapsed_s": round(time.perf_counter() - started, 3),
             }
 
@@ -97,8 +97,19 @@ def main() -> None:
     """Configure and serve the text-to-speech MCP endpoint."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("logs/narration"))
+    parser.add_argument(
+        "--tts-backend",
+        choices=["ovos", "edge"],
+        default="ovos",
+        help="ovos: local OpenVoiceOS MCP server (WAV); "
+        "edge: Microsoft Edge online voices (MP3, needs network)",
+    )
     parser.add_argument("--tts-url", default="http://127.0.0.1:9666/mcp/")
-    parser.add_argument("--voice", help="OVOS voice override; otherwise use its config")
+    parser.add_argument(
+        "--voice",
+        help="OVOS voice id (e.g. piper/zh_CN-huayan-medium) or edge voice "
+        "(e.g. zh-CN-XiaoxiaoNeural); defaults per backend",
+    )
     parser.add_argument("--lang", default="zh-CN")
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--host", default="127.0.0.1")
@@ -106,11 +117,18 @@ def main() -> None:
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be positive and finite")
+    if args.tts_backend == "edge":
+        client = EdgeTtsClient(
+            **({"voice": args.voice} if args.voice else {}),
+            timeout=args.timeout,
+        )
+    else:
+        client = OvosTtsClient(
+            args.tts_url, voice=args.voice, lang=args.lang, timeout=args.timeout
+        )
     server = build_server(
         output_dir=args.output_dir,
-        tts=OvosTtsClient(
-            args.tts_url, voice=args.voice, lang=args.lang, timeout=args.timeout
-        ),
+        tts=client,
         host=args.host,
         port=args.port,
         timeout=args.timeout,

@@ -9,8 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Consume OpenVoiceOS's MCP synthesize tool without forwarding audio to the LLM."""
+"""Text-to-speech backends that keep audio out of the planner's context.
 
+Both clients expose ``async synthesize(text) -> bytes`` plus the ``suffix`` and
+``mime_type`` describing what they return, so the MCP server stays backend
+agnostic: OpenVoiceOS returns PCM WAV and edge-tts returns MP3.
+"""
+
+import asyncio
 import base64
 import io
 import json
@@ -56,6 +62,9 @@ def decode_audio(result: types.CallToolResult) -> bytes:
 class OvosTtsClient:
     """Open and close one MCP session per synthesis request."""
 
+    suffix = ".wav"
+    mime_type = "audio/wav"
+
     def __init__(
         self,
         url: str,
@@ -86,3 +95,68 @@ class OvosTtsClient:
                     await session.initialize()
                     result = await session.call_tool("synthesize", arguments)
         return decode_audio(result)
+
+
+class EdgeTtsClient:
+    """Synthesize through Microsoft Edge's online voices and return MP3 bytes.
+
+    ``edge_tts`` is an optional import: it is only needed when this backend is
+    selected. The service is remote, so every request needs network access.
+    """
+
+    suffix = ".mp3"
+    mime_type = "audio/mpeg"
+
+    def __init__(
+        self,
+        *,
+        voice: str = "zh-CN-XiaoxiaoNeural",
+        rate: str | None = None,
+        volume: str | None = None,
+        timeout: float = 60,
+    ) -> None:
+        self.voice = voice
+        self.rate = rate
+        self.volume = volume
+        self.timeout = timeout
+
+    async def synthesize(self, text: str) -> bytes:
+        """Return MP3 bytes for ``text``.
+
+        Raises:
+            RuntimeError: If the service fails or no audio is produced.
+        """
+        try:
+            import edge_tts
+        except ImportError as exc:
+            raise RuntimeError(
+                "the edge-tts backend needs the optional edge-tts package; "
+                "install it with `pip install edge-tts`"
+            ) from exc
+
+        options = {
+            name: value
+            for name, value in (("rate", self.rate), ("volume", self.volume))
+            if value is not None
+        }
+        communicate = edge_tts.Communicate(text, self.voice, **options)
+        chunks: list[bytes] = []
+        try:
+
+            async def collect() -> None:
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        chunks.append(chunk["data"])
+
+            await asyncio.wait_for(collect(), timeout=self.timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"edge-tts exceeded its {self.timeout:g}s timeout"
+            ) from exc
+        except Exception as exc:
+            detail = str(exc) or type(exc).__name__
+            raise RuntimeError(f"edge-tts synthesis failed: {detail[:300]}") from exc
+        audio = b"".join(chunks)
+        if not audio:
+            raise RuntimeError("edge-tts returned no audio")
+        return audio
