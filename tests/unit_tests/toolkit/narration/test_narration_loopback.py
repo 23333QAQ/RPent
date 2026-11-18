@@ -180,3 +180,123 @@ def test_two_http_mcp_hops_save_audio(tmp_path, caller, monkeypatch):
     assert result["text"] == "黑色画面。"
     assert Path(result["audio_path"]).read_bytes() == audio
     assert "data" not in result
+
+
+def test_api_narrator_reads_and_speaks_in_the_background(tmp_path, monkeypatch):
+    pytest.importorskip("PIL.Image")
+    state = EnvState(tmp_path / "state")
+    with state.record_step(state={}):
+        state.save("scene.png", np.zeros((4, 4, 3), dtype=np.uint8))
+    picture = state.artifact_path("scene.png", step=0)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 160)
+    audio = buffer.getvalue()
+    calls = []
+    spoken = threading.Event()
+    ovos = FastMCP("fake-ovos", stateless_http=True, json_response=True)
+
+    @ovos.tool()
+    def synthesize(
+        text: str, voice: str | None = None, lang: str | None = None
+    ) -> dict:
+        calls.append((text, voice, lang))
+        spoken.set()
+        return {
+            "mime_type": "audio/wav",
+            "data": base64.b64encode(audio).decode(),
+            "path": "/remote/unused.wav",
+        }
+
+    def run_planner(url):
+        class NarrationToolkit(Toolkit):
+            def _register_common_tools(self):
+                self.add_tool(CommonTools(memory=self._memory).finish)
+
+        monkeypatch.setattr("rpent.planner.api_loop.substitute", lambda value: value)
+        monkeypatch.setattr("rpent.tools.toolkit.substitute", lambda value: value)
+        monkeypatch.setenv("PYDANTIC_AI_NO_BANNER", "1")
+        events = NullDashboardEventSink()
+        toolkit = NarrationToolkit(
+            dashboard_events=events, memory=SimpleNamespace(), state=state
+        )
+
+        async def main_model(messages, info):
+            returned = [
+                p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)
+            ]
+            if not returned:
+                yield {
+                    0: DeltaToolCall(
+                        name="start_scene_narrator", json_args=json.dumps({})
+                    )
+                }
+                return
+            await asyncio.to_thread(spoken.wait, 5)
+            yield {
+                0: DeltaToolCall(
+                    name="finish",
+                    json_args=json.dumps(
+                        {"status": "success", "summary": "Audio saved"}
+                    ),
+                )
+            }
+
+        async def narrator_model(messages, info):
+            returned = [
+                p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)
+            ]
+            if not returned:
+                name, args = "read_image", {"name": "scene.png", "step": 0}
+            elif returned[-1].tool_name == "read_image":
+                images = [
+                    item
+                    for message in messages
+                    for part in message.parts
+                    if isinstance(part, (ToolReturnPart, UserPromptPart))
+                    and isinstance(part.content, list)
+                    for item in part.content
+                    if isinstance(item, BinaryContent)
+                ]
+                assert images[0].data == picture.read_bytes()
+                name, args = "tts_synthesize", {"text": "黑色画面。"}
+            else:
+                yield "Narration finished."
+                return
+            yield {0: DeltaToolCall(name=name, json_args=json.dumps(args))}
+
+        site = tmp_path / "site.yaml"
+        site.write_text(
+            f"mcp_servers:\n  tts:\n    url: {url}\n    planner_tools: [synthesize]\n"
+        )
+        planner = ApiAgentLoop(
+            model=FunctionModel(stream_function=main_model),
+            narrator_model=FunctionModel(stream_function=narrator_model),
+            dashboard_events=events,
+            mcp_servers=load_site_mcp_servers(site),
+        )
+        try:
+            result = planner.solve(
+                system_prompt="Narrate the scene and finish.",
+                user_message="Narrate scene.png at step 0.",
+                toolkit=toolkit,
+                max_turns=3,
+            )
+            assert result.error is None, result.error
+            assert result.finish_result["status"] == "success"
+            assert base64.b64encode(audio).decode() not in json.dumps(result.messages)
+        finally:
+            toolkit.close()
+
+    with http_server(ovos) as tts_url:
+        narration = build_server(
+            output_dir=tmp_path / "audio",
+            tts=OvosTtsClient(tts_url, voice="test-voice"),
+        )
+        with http_server(narration) as narration_url:
+            run_planner(narration_url)
+
+    assert calls == [("黑色画面。", "test-voice", "zh-CN")]

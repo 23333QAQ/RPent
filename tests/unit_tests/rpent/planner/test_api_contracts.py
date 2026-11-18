@@ -24,7 +24,9 @@ import queue
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -42,7 +44,13 @@ from pydantic_core import to_jsonable_python
 
 from rpent.dashboard.events import RunStartedEvent, TranscriptEvent, UsageEvent
 from rpent.dashboard.state import DashboardState
-from rpent.planner.api_loop import ApiAgentLoop, _external_result_text, _HarnessToolkit
+from rpent.planner.api_loop import (
+    ApiAgentLoop,
+    _external_result_text,
+    _HarnessToolkit,
+    _resolve_narrator_sources,
+    _SceneNarrator,
+)
 from rpent.session import EnvState, Payload
 from rpent.tools import Toolkit, ToolResult, common
 from rpent.tools import tool as declare_tool
@@ -89,11 +97,32 @@ class RobotToolkit(Toolkit):
         return super().execute_tool(name, input_dict)
 
 
+NARRATOR_TTS = McpServerSpec(
+    name="tts",
+    url="http://127.0.0.1:8766/mcp",
+    planner_tools=("synthesize",),
+)
+
+
+class NarratorToolkit(RobotToolkit):
+    """Toolkit with the observation tool the narrator may use."""
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.add_tool(self.view_env_state)
+
+    @declare_tool(readonly=True)
+    def view_env_state(self, step: int = -1) -> ToolResult:
+        return ToolResult(data={"step": step, "terminated": False})
+
+
 @pytest.fixture(autouse=True)
 def local_tools(monkeypatch):
     monkeypatch.setattr("rpent.tools.toolkit.substitute", lambda value: value)
     monkeypatch.setattr("rpent.planner.api_loop.substitute", lambda value: value)
     monkeypatch.setenv("PYDANTIC_AI_NO_BANNER", "1")
+    monkeypatch.delenv("RPENT_API_NARRATOR_MODEL", raising=False)
+    monkeypatch.delenv("RPENT_API_NARRATOR_BASE_URL", raising=False)
 
 
 def tool(name, args=None, index=0):
@@ -1820,3 +1849,260 @@ def test_external_result_text_renders_result_shapes() -> None:
         _external_result_text(BinaryContent(data=b"png", media_type="image/png"))
         == "[image: image/png, 3 bytes]"
     )
+
+
+def test_narrator_sources_include_planner_observations_and_synthesize() -> None:
+    events = Events()
+    toolkit = NarratorToolkit(events)
+
+    observe, speak = _resolve_narrator_sources(toolkit, (NARRATOR_TTS,))
+
+    assert observe == ("view_env_state", "read_image")
+    assert speak == (NARRATOR_TTS,)
+
+
+def test_narrator_requires_a_server_listing_synthesize() -> None:
+    with pytest.raises(ValueError, match="synthesize under planner_tools"):
+        _resolve_narrator_sources(NarratorToolkit(Events()), ())
+
+
+def test_narrator_agent_exposes_only_observation_and_tts_toolsets() -> None:
+    from pydantic_ai.toolsets.filtered import FilteredToolset
+    from pydantic_ai.toolsets.prefixed import PrefixedToolset
+
+    events = Events()
+    toolkit = NarratorToolkit(events)
+    planner = ApiAgentLoop(
+        model=TestModel(),
+        dashboard_events=events,
+        mcp_servers=(NARRATOR_TTS,),
+        narrator_model=TestModel(),
+    )
+    adapter = _HarnessToolkit(toolkit, dashboard_events=events, no_images=False)
+    sources = _resolve_narrator_sources(toolkit, (NARRATOR_TTS,))
+
+    narrator = planner._build_scene_narrator(toolkit, adapter, sources)
+
+    toolsets = narrator._agent._user_toolsets
+    assert narrator._agent.name == "scene_narrator"
+    assert len(toolsets) == 2
+    assert isinstance(toolsets[0], FilteredToolset)
+    assert isinstance(toolsets[1], PrefixedToolset)
+    assert toolsets[1].prefix == "tts"
+    assert isinstance(toolsets[1].wrapped, FilteredToolset)
+
+
+def test_start_scene_narrator_is_idempotent_and_stops_the_task() -> None:
+    class BlockingAgent:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
+
+        async def run(self, *args: Any, **kwargs: Any) -> None:
+            self.calls += 1
+            self.started.set()
+            await asyncio.Event().wait()
+
+    class Recorder:
+        capture = None
+
+        def _record_call(self, *args: Any) -> None:
+            return None
+
+        def _record_result(self, *args: Any) -> None:
+            return None
+
+    async def scenario() -> tuple[str, str, int]:
+        agent = BlockingAgent()
+        narrator = _SceneNarrator(agent, Recorder(), Events())
+        ctx = SimpleNamespace(tool_call_id="call-1")
+
+        first = await narrator.start(ctx)
+        await asyncio.wait_for(agent.started.wait(), timeout=1)
+        second = await narrator.start(ctx)
+        await narrator.stop()
+        return first, second, agent.calls
+
+    first, second, calls = asyncio.run(scenario())
+
+    assert "started" in first
+    assert "already running" in second
+    assert calls == 1
+
+
+def test_start_scene_narrator_records_a_completed_tool_call() -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.started = False
+            self.finished: str | None = None
+            self.payload = None
+
+        def tool(self, ctx):
+            return nullcontext()
+
+        def start(self) -> None:
+            self.started = True
+
+        def result(self, payload) -> None:
+            self.payload = payload
+
+        def feedback(self, ctx, format: str, value) -> None:
+            return None
+
+        def finish(self, status: str, detail: str = "") -> None:
+            self.finished = status
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.capture = Capture()
+
+        def _record_call(self, *args: Any) -> None:
+            return None
+
+        def _record_result(self, *args: Any) -> None:
+            return None
+
+    class IdleAgent:
+        async def run(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    async def scenario() -> tuple[Capture, str]:
+        recorder = Recorder()
+        narrator = _SceneNarrator(IdleAgent(), recorder, Events())
+        text = await narrator.start(SimpleNamespace(tool_call_id="call-1"))
+        await narrator._task
+        return recorder.capture, text
+
+    capture, text = asyncio.run(scenario())
+
+    assert "started" in text
+    assert capture.started is True
+    assert capture.finished == "completed"
+    assert capture.payload.data["data"]["text"] == text
+
+
+def test_solve_starts_narrator_without_counting_its_usage(tmp_path) -> None:
+    events = Events()
+    toolkit = NarratorToolkit(events)
+    narrator_started = asyncio.Event()
+    main_requests: list[int] = []
+    narrator_requests: list[int] = []
+
+    async def main_stream(messages, info):
+        main_requests.append(1)
+        if len(main_requests) == 1:
+            yield tool("start_scene_narrator")
+        else:
+            await asyncio.wait_for(narrator_started.wait(), timeout=2)
+            yield finish()
+
+    async def narrator_stream(messages, info):
+        narrator_requests.append(1)
+        narrator_started.set()
+        yield "黑色画面。"
+
+    planner = ApiAgentLoop(
+        model=FunctionModel(stream_function=main_stream),
+        dashboard_events=events,
+        mcp_servers=(NARRATOR_TTS,),
+        narrator_model=FunctionModel(stream_function=narrator_stream),
+    )
+    # Both the main and narrator MCP toolsets are covered separately; avoid a
+    # real connection for this lifecycle/usage test.
+    planner._external_toolsets = lambda adapter: []
+    planner._narrator_toolsets = lambda recorder, servers: []
+
+    result = planner.solve(
+        system_prompt="Use the robot toolkit. Finish when done.",
+        user_message="Do the task.",
+        toolkit=toolkit,
+        max_turns=3,
+    )
+
+    assert result.error is None
+    assert result.finish_result == {"_finish": True, **FINISH_ARGS}
+    assert len(main_requests) == 2
+    assert len(narrator_requests) == 1
+    # The narrator has its own request budget and must not consume the main one.
+    assert result.stats["turns_used"] == 2
+    transcript = [
+        event.payload for event in events.events if isinstance(event, TranscriptEvent)
+    ]
+    assert any(
+        payload.get("text") == "[scene_narrator] 黑色画面。" for payload in transcript
+    )
+    assert "黑色画面。" not in json.dumps(result.messages)
+
+
+def test_solve_rejects_narrator_without_a_synthesize_server() -> None:
+    planner = ApiAgentLoop(
+        model=TestModel(),
+        dashboard_events=Events(),
+        narrator_model=TestModel(),
+    )
+
+    with pytest.raises(ValueError, match="synthesize under planner_tools"):
+        planner.solve(
+            system_prompt="Use the robot toolkit. Finish when done.",
+            user_message="Do the task.",
+            toolkit=NarratorToolkit(Events()),
+            max_turns=1,
+        )
+
+
+def test_build_planner_reads_the_api_narrator_model(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpent.planner import base as planner_base
+
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_build_api_model(model, base_url=None):
+        calls.append((model, base_url))
+        return TestModel()
+
+    monkeypatch.setattr(planner_base, "build_api_model", fake_build_api_model)
+    monkeypatch.setenv("RPENT_API_NARRATOR_MODEL", "openai:gpt-5.5-mini")
+
+    planner = planner_base.build_planner(
+        "api",
+        output_dir=tmp_path,
+        recipe_tag="t",
+        robot_name="libero",
+        dashboard_events=Events(),
+        model="openai:gpt-5.5",
+        base_url="https://proxy.example",
+    )
+
+    assert planner.narrator_model is not None
+    assert calls == [
+        ("openai:gpt-5.5", "https://proxy.example"),
+        ("openai:gpt-5.5-mini", "https://proxy.example"),
+    ]
+
+
+def test_build_planner_does_not_apply_a_foreign_base_url_to_the_narrator(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpent.planner import base as planner_base
+
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_build_api_model(model, base_url=None):
+        calls.append((model, base_url))
+        return TestModel()
+
+    monkeypatch.setattr(planner_base, "build_api_model", fake_build_api_model)
+    monkeypatch.setenv("RPENT_API_NARRATOR_MODEL", "anthropic:claude-haiku-4-5")
+
+    planner_base.build_planner(
+        "api",
+        output_dir=tmp_path,
+        recipe_tag="t",
+        robot_name="libero",
+        dashboard_events=Events(),
+        model="openai:gpt-5.5",
+        base_url="https://proxy.example",
+    )
+
+    assert calls[-1] == ("anthropic:claude-haiku-4-5", None)

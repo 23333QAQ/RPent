@@ -50,6 +50,20 @@ def resolve_model(planner: str, model: str | None) -> str | None:
     return model or (os.environ.get("CODEX_MODEL") if planner == "codex" else None)
 
 
+def _same_provider(left: str | None, right: str | None) -> bool:
+    """Whether two provider-prefixed model ids use the same provider."""
+
+    def provider(model: str | None) -> str | None:
+        if not model or ":" not in model:
+            return None
+        name = model.split(":", 1)[0]
+        # ``openai`` and ``openai-chat`` share the OpenAI endpoint variables.
+        return "openai" if name in {"openai", "openai-chat"} else name
+
+    provider_name = provider(left)
+    return provider_name is not None and provider_name == provider(right)
+
+
 def add_mcp_prefix(name: str) -> str:
     """Return the namespaced MCP tool name for a bare tool name."""
     if name.startswith(MCP_TOOL_PREFIX):
@@ -280,6 +294,13 @@ def build_planner(
         from rpent.planner.api_loop import ApiAgentLoop
 
         api_model = build_api_model(model, base_url)
+        api_narrator = os.environ.get("RPENT_API_NARRATOR_MODEL") or None
+        narrator_model = None
+        if api_narrator:
+            narrator_base_url = os.environ.get("RPENT_API_NARRATOR_BASE_URL") or None
+            if narrator_base_url is None and _same_provider(model, api_narrator):
+                narrator_base_url = base_url
+            narrator_model = build_api_model(api_narrator, narrator_base_url)
         api_timeout_s = planner_timeout_s
         if api_timeout_s is None:
             api_timeout_s = int(os.environ.get("CELL_TIMEOUT_S", "1200"))
@@ -292,6 +313,7 @@ def build_planner(
             timeout_s=api_timeout_s,
             interactive=interactive,
             mcp_servers=planner_servers,
+            narrator_model=narrator_model,
         )
     if planner_type == "claude_code":
         from rpent.planner.claude_code import ClaudeCodePlanner
@@ -336,6 +358,7 @@ def build_planner(
             dashboard_events=dashboard_events,
             reasoning_effort=reasoning_effort,
             mcp_servers=planner_servers,
+            narrator_model=os.environ.get("RPENT_CODEX_NARRATOR_MODEL") or None,
         )
     if planner_type == "flash":
         from rpent.planner.flash import FlashPlanner

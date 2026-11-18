@@ -93,6 +93,21 @@ Relevant ``api`` planner knobs:
 - ``--no-images`` — never send image bytes; this is required for
   text-only models. The agent then reasons from textual state alone,
   so task performance may not be satisfactory.
+- Setting ``RPENT_API_NARRATOR_MODEL`` to a provider-prefixed model id (for
+  example ``anthropic:claude-haiku-4-5``) registers a separate
+  ``scene_narrator`` agent. The main agent starts it with
+  ``start_scene_narrator`` when narration is requested; it repeatedly reads the
+  latest observation, writes one short Chinese sentence, and calls the
+  external MCP tool named ``<server>_synthesize``. It stops when the episode
+  reports ``terminated`` or ``truncated`` or after 200 model requests, and the
+  main run also stops it on exit. It has its own request budget and compaction
+  window, so it does not consume ``--max-turns``. The run therefore needs a
+  server listing ``synthesize`` under ``planner_tools`` (see
+  :ref:`external-mcp-servers`). The narrator always receives observation
+  images, including when the main planner uses ``--no-images``. If the
+  narrator uses a different provider, ``--base-url`` is not applied to it; set
+  ``RPENT_API_NARRATOR_BASE_URL`` or the provider's own endpoint variable
+  instead.
 
 For ``--tui`` usage, see :ref:`Terminal interaction <quickstart-interactive>`.
 

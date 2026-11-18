@@ -74,6 +74,9 @@ RPent 通过一个 CLI 参数选择 Agentic Planner 的后端：
 
 - ``--max-tokens`` —— 单次 LLM 回复的 token 上限（默认 ``8192``）。
 - ``--no-images`` —— 不向模型发送图片字节；纯文本模型必须加此参数。此时智能体只依赖文本状态推理，任务表现可能不够理想。
+- 将 ``RPENT_API_NARRATOR_MODEL`` 设为带提供商前缀的模型 id（例如 ``anthropic:claude-haiku-4-5``）后，会注册一个独立的 ``scene_narrator`` agent。主 agent 在任务要求播报时通过
+  ``start_scene_narrator`` 启动它；它反复读取最新观测，写一句简短中文，并调用名为
+  ``<server>_synthesize`` 的外部 MCP 工具。环境报告 ``terminated`` 或 ``truncated``、达到 200 次模型请求上限，或主运行结束时，它都会停止。它有独立的请求预算和压缩窗口，不占用 ``--max-turns``。因此本次运行需要一个在 ``planner_tools`` 中列出 ``synthesize`` 的服务（见 :ref:`external-mcp-servers`）。即使主 planner 使用 ``--no-images``，narrator 仍会接收观测图像。若 narrator 使用不同的提供商，``--base-url`` 不会应用给它；请设置 ``RPENT_API_NARRATOR_BASE_URL`` 或该提供商自己的地址变量。
 
 终端交互方式见 :ref:`终端交互 <quickstart-interactive>`。
 

@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import queue
+import stat
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +82,23 @@ class FakeToolkit:
 
     def resume_calls(self) -> None:
         pass
+
+
+class ObservingToolkit(FakeToolkit):
+    """Toolkit with the observation tools a narrator may use."""
+
+    def list_tools(self):
+        return (
+            *super().list_tools(),
+            SimpleNamespace(name="view_env_state"),
+            SimpleNamespace(name="read_image"),
+            SimpleNamespace(name="move_to"),
+        )
+
+
+NARRATOR_TTS = McpServerSpec(
+    name="tts", url="http://127.0.0.1:8766/mcp", planner_tools=("synthesize",)
+)
 
 
 class FakeMcpServer:
@@ -466,6 +484,192 @@ def test_config_overrides_include_optional_context_limits(
         "model_context_window=262144",
         "model_auto_compact_token_limit=230000",
     ]
+
+
+def test_narrator_role_is_read_only_and_speaks_through_synthesize() -> None:
+    lights = McpServerSpec(
+        name="lights", url="http://127.0.0.1:1/mcp", planner_tools=("dim",)
+    )
+    sources = codex_module._resolve_narrator_sources(
+        ObservingToolkit(), (NARRATOR_TTS,)
+    )
+
+    text = codex_module._scene_narrator_role_toml(
+        sources=sources,
+        model="haiku",
+        mcp_url="http://127.0.0.1:9999/mcp/",
+        model_provider=PROVIDER_ID,
+        servers=(lights, NARRATOR_TTS),
+    )
+
+    assert 'model = "haiku"' in text
+    assert f'model_provider = "{PROVIDER_ID}"' in text
+    assert 'sandbox_mode = "read-only"' in text
+    assert 'approval_policy = "never"' in text
+    assert "tools.web_search = false" in text
+    assert 'mcp_servers.rpent.enabled_tools = ["view_env_state", "read_image"]' in text
+    assert 'mcp_servers.tts.enabled_tools = ["synthesize"]' in text
+    assert "mcp_servers.lights.enabled = false" in text
+    assert "move_to" not in text
+    assert "Repeat this round" in text
+
+
+def test_narrator_role_preserves_synthesize_server_headers() -> None:
+    voice = McpServerSpec(
+        name="voice",
+        url="https://voice.example/mcp",
+        headers={"Authorization": "Bearer token"},
+        env_http_headers={"X-Site-Token": "SITE_TOKEN"},
+        planner_tools="*",
+    )
+    sources = codex_module._resolve_narrator_sources(ObservingToolkit(), (voice,))
+
+    text = codex_module._scene_narrator_role_toml(
+        sources=sources,
+        model=None,
+        mcp_url="http://127.0.0.1:9999/mcp/",
+        servers=(voice,),
+    )
+
+    assert 'mcp_servers.voice.enabled_tools = ["synthesize"]' in text
+    assert 'mcp_servers.voice.http_headers = {"Authorization" = "Bearer token"}' in text
+    assert (
+        'mcp_servers.voice.env_http_headers = {"X-Site-Token" = "SITE_TOKEN"}' in text
+    )
+
+
+def test_narrator_overrides_register_a_background_agent_type(tmp_path: Path) -> None:
+    role_path = tmp_path / "codex.scene_narrator.toml"
+
+    overrides = codex_module._scene_narrator_overrides(role_path)
+
+    assert overrides[0].startswith("agents.scene_narrator.description=")
+    assert 'fork_turns=\\"none\\"' in overrides[0]
+    assert "do not wait" in overrides[0]
+    assert (
+        f"agents.scene_narrator.config_file={json.dumps(str(role_path))}"
+        in (overrides[1])
+    )
+    assert overrides[2] == "features.multi_agent=true"
+
+
+def test_build_config_writes_the_narrator_role_with_owner_only_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_BASE_URL", raising=False)
+    planner = CodexPlanner(
+        output_dir=str(tmp_path),
+        repo_root=tmp_path,
+        output_path=tmp_path / "codex.out",
+        model="fake-codex",
+        dashboard_events=RecordingSink(),
+        mcp_servers=(NARRATOR_TTS,),
+        narrator_model="haiku",
+    )
+    sources = codex_module._resolve_narrator_sources(
+        ObservingToolkit(), (NARRATOR_TTS,)
+    )
+
+    config = planner._build_config(
+        "http://fake.invalid/mcp/",
+        output_path=tmp_path / "codex.out",
+        narrator_sources=sources,
+    )
+
+    role_path = tmp_path / "codex.scene_narrator.toml"
+    assert role_path.is_file()
+    assert stat.S_IMODE(role_path.stat().st_mode) == 0o600
+    role_text = role_path.read_text()
+    assert 'mcp_servers.tts.enabled_tools = ["synthesize"]' in role_text
+    assert "move_to" not in role_text
+    assert (
+        f"agents.scene_narrator.config_file={json.dumps(str(role_path))}"
+        in config.config_overrides
+    )
+    assert "features.multi_agent=true" in config.config_overrides
+
+
+def test_build_config_keeps_existing_overrides_without_a_narrator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_BASE_URL", raising=False)
+    planner = make_planner(tmp_path, RecordingSink())
+
+    config = planner._build_config(
+        "http://fake.invalid/mcp/", output_path=tmp_path / "codex.out"
+    )
+
+    assert not any(entry.startswith("agents.") for entry in config.config_overrides)
+    assert "features.multi_agent=true" not in config.config_overrides
+
+
+def test_build_planner_reads_codex_narrator_model_from_the_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rpent.planner.base import build_planner
+
+    monkeypatch.setenv("RPENT_CODEX_NARRATOR_MODEL", "gpt-5.5")
+
+    planner = build_planner(
+        "codex",
+        output_dir=tmp_path,
+        recipe_tag="t",
+        robot_name="libero",
+        memory_dir=tmp_path / "memory",
+        dashboard_events=RecordingSink(),
+    )
+
+    assert planner._narrator_model == "gpt-5.5"
+
+
+@pytest.mark.parametrize(
+    ("toolkit", "servers", "message"),
+    [
+        (FakeToolkit(), (NARRATOR_TTS,), "view_env_state or read_image"),
+        (ObservingToolkit(), (), "synthesize under planner_tools"),
+        (
+            ObservingToolkit(),
+            (McpServerSpec(name="dock", url="http://127.0.0.1:1/mcp"),),
+            "synthesize under planner_tools",
+        ),
+    ],
+)
+def test_narrator_sources_require_observation_and_speech(
+    toolkit: FakeToolkit,
+    servers: tuple[McpServerSpec, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        codex_module._resolve_narrator_sources(toolkit, servers)
+
+
+def test_narrator_solve_rejects_missing_sources_before_starting_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_backend(monkeypatch)
+    planner = CodexPlanner(
+        output_dir=str(tmp_path),
+        repo_root=tmp_path,
+        output_path=tmp_path / "codex.out",
+        model="fake-codex",
+        dashboard_events=RecordingSink(),
+        mcp_servers=(NARRATOR_TTS,),
+        narrator_model="haiku",
+    )
+
+    with pytest.raises(ValueError, match="view_env_state or read_image"):
+        planner.solve(
+            system_prompt="system rules",
+            user_message="user task",
+            toolkit=FakeToolkit(),
+            max_turns=1,
+        )
+
+    assert FakeMcpServer.instances == []
 
 
 @pytest.mark.parametrize("trace_enabled", [False, True])
@@ -972,6 +1176,70 @@ def test_response_count_ignores_items_and_duplicate_usage():
     )
     assert recorder.turns == 2
     assert recorder.stats()["total_input_tokens"] == 20
+
+
+def test_recorder_renders_subagent_tool_calls_and_activity() -> None:
+    recorder = codex_module._Recorder(max_turns=3, dashboard_events=RecordingSink())
+
+    rendered = recorder.observe(
+        {
+            "method": "item/completed",
+            "payload": {
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "receiverThreadIds": ["thread-1"],
+                    "prompt": "narrate the view",
+                }
+            },
+        }
+    )
+    activity = recorder.observe(
+        {
+            "method": "item/completed",
+            "payload": {
+                "item": {
+                    "type": "subAgentActivity",
+                    "kind": "started",
+                    "agentPath": "/root/scene_narrator",
+                }
+            },
+        }
+    )
+
+    assert "[tool<-] agent:spawnAgent" in rendered
+    assert '"agents": ["thread-1"]' in rendered
+    assert '"prompt_size": 16' in rendered
+    assert "narrate the view" not in rendered
+    assert activity == "[subagent] started: /root/scene_narrator\n"
+    assert recorder.tool_calls == 1
+
+
+def test_recorder_ignores_subagent_token_usage() -> None:
+    recorder = codex_module._Recorder(max_turns=3, dashboard_events=RecordingSink())
+    recorder.main_thread_id = "main"
+    child_usage = {
+        "method": "thread/tokenUsage/updated",
+        "payload": {
+            "thread_id": "child",
+            "token_usage": {"total": {"input_tokens": 10, "output_tokens": 5}},
+        },
+    }
+
+    assert recorder.observe(child_usage) == ""
+    assert recorder.turns == 0
+
+    main_usage = {
+        "method": "thread/tokenUsage/updated",
+        "payload": {
+            "thread_id": "main",
+            "token_usage": {"total": {"input_tokens": 10, "output_tokens": 5}},
+        },
+    }
+
+    assert "turn 1/3" in recorder.observe(main_usage)
+    assert recorder.turns == 1
 
 
 def test_rejected_finish_item_is_not_promoted() -> None:

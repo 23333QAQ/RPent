@@ -24,6 +24,7 @@ import json
 import threading
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager, nullcontext
+from contextvars import Context
 from functools import partial
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -76,6 +77,7 @@ from rpent.planner.base import (
     cancel_and_wait,
     execute_tool,
 )
+from rpent.session import Payload
 from rpent.session.env_capture import current_tool_call
 from rpent.session.planner_capture import CapturingModel, sdk_payload
 from rpent.tools.toolkit import Toolkit, ToolResult
@@ -87,6 +89,34 @@ if TYPE_CHECKING:
 
 logger = get_logger("api")
 
+#: Model-request budget for one scene narration session. This is independent of
+#: the main conversation's ``max_turns``.
+_NARRATOR_MAX_REQUESTS = 200
+
+_SCENE_NARRATOR_PROMPT = (
+    "You narrate a robot's camera view continuously. Repeat this round until "
+    "told to stop:\n"
+    "1. Call view_env_state(step=-1) or read_image for the latest observation "
+    "and look at agentview_high.png.\n"
+    "2. Write one Chinese sentence of at most 20 characters about the arm and "
+    "the main objects, without Markdown. If the view has not changed since "
+    "your last round, describe a different detail.\n"
+    "3. Call a text-to-speech tool whose name ends with '_synthesize' once with "
+    "exactly that sentence, and wait for it to return before starting the next "
+    "round.\n"
+    "Start the next round immediately, whether or not the view changed. Stop "
+    "and reply with a one-line summary only when view_env_state reports "
+    "terminated or truncated as true, or a tool reports that the session is "
+    "closed. Do not call any other tool."
+)
+
+_START_NARRATOR_DESCRIPTION = (
+    "Start the background scene narrator. It repeatedly reads the latest robot "
+    "observation and speaks one short Chinese sentence through the external "
+    "text-to-speech MCP tool until the episode ends. Call it once when the user "
+    "asks for spoken narration; do not wait for it."
+)
+
 
 class _RequestBudgetExhausted(Exception):
     """The conversation has used its configured model-request budget."""
@@ -96,6 +126,49 @@ def _is_response_truncation(exc: UnexpectedModelBehavior) -> bool:
     """Match the SDK's token-limit-without-usable-output failure."""
     message = str(exc).lower()
     return "token limit" in message and "before any response was generated" in message
+
+
+def _mcp_toolset() -> Any:
+    """Return the optional pydantic-ai MCP toolset class."""
+    try:
+        from pydantic_ai.mcp import MCPToolset
+    except ImportError as exc:
+        raise RuntimeError(
+            "attaching external MCP servers to the 'api' planner requires "
+            "the pydantic-ai MCP client; install it with "
+            '`pip install "pydantic-ai-slim[mcp]"`.'
+        ) from exc
+    return MCPToolset
+
+
+def _resolve_narrator_sources(
+    toolkit: Toolkit, mcp_servers: tuple["McpServerSpec", ...]
+) -> tuple[tuple[str, ...], tuple["McpServerSpec", ...]]:
+    """Find the observation tools and synthesis servers a narrator may use.
+
+    Raises:
+        ValueError: If no attached planner-layer server lists ``synthesize``.
+    """
+    from rpent.utils.mcp_servers import ALL_TOOLS
+
+    names = {declaration.name for declaration in toolkit.list_tools()}
+    observe = tuple(
+        name
+        for name in ("view_env_state", "read_image")
+        if name in names or name == "read_image"
+    )
+    speak = tuple(
+        server
+        for server in mcp_servers
+        if server.planner_tools == ALL_TOOLS
+        or (server.planner_tools and "synthesize" in server.planner_tools)
+    )
+    if not speak:
+        raise ValueError(
+            "the scene_narrator subagent needs an external MCP server listing "
+            "synthesize under planner_tools"
+        )
+    return observe, speak
 
 
 class ApiAgentLoop(Planner):
@@ -112,12 +185,21 @@ class ApiAgentLoop(Planner):
         timeout_s: float = 1200,
         interactive: bool = False,
         mcp_servers: tuple["McpServerSpec", ...] = (),
+        narrator_model: Model | None = None,
     ) -> None:
+        """Initialize the API planner.
+
+        Args:
+            narrator_model: Optional model for a background ``scene_narrator``
+                agent. ``None`` disables narration and leaves the main agent
+                unchanged.
+        """
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         if max_tokens < 1 or timeout_s <= 0:
             raise ValueError("max_tokens and timeout_s must be positive")
         self.model = model
+        self.narrator_model = narrator_model
         self.dashboard_events = dashboard_events
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
@@ -171,6 +253,11 @@ class ApiAgentLoop(Planner):
             if state is not None and state.get_task() is not None
             else None
         )
+        narrator_sources = (
+            _resolve_narrator_sources(toolkit, self.mcp_servers)
+            if self.narrator_model is not None
+            else None
+        )
         try:
             # The adapter registers one pydantic-ai tool per Toolkit tool, so a
             # robot tool that reuses a planner-owned name (read_image) fails
@@ -182,6 +269,21 @@ class ApiAgentLoop(Planner):
                 no_images=self.no_images,
                 capture=capture,
             )
+            narrator = (
+                self._build_scene_narrator(toolkit, adapter, narrator_sources)
+                if narrator_sources is not None
+                else None
+            )
+            if narrator is not None:
+                adapter.add_tool(
+                    Tool(
+                        narrator.start,
+                        name="start_scene_narrator",
+                        description=_START_NARRATOR_DESCRIPTION,
+                        takes_ctx=True,
+                        sequential=True,
+                    )
+                )
         except Exception as exc:
             logger.exception("Harness toolkit construction failed")
             return PlannerResult(
@@ -190,6 +292,7 @@ class ApiAgentLoop(Planner):
         session = _Session(
             adapter, conversation_id, max_turns, interactive=self.interactive
         )
+        session.narrator = narrator
         if interaction is not None:
             session.control = DashboardPlannerControl(
                 interaction=interaction,
@@ -283,14 +386,7 @@ class ApiAgentLoop(Planner):
         ]
         if not servers:
             return []
-        try:
-            from pydantic_ai.mcp import MCPToolset
-        except ImportError as exc:
-            raise RuntimeError(
-                "attaching external MCP servers to the 'api' planner requires "
-                "the pydantic-ai MCP client; install it with "
-                '`pip install "pydantic-ai-slim[mcp]"`.'
-            ) from exc
+        MCPToolset = _mcp_toolset()
 
         from rpent.utils.mcp_servers import ALL_TOOLS, request_headers
 
@@ -310,9 +406,81 @@ class ApiAgentLoop(Planner):
             toolsets.append(toolset.prefixed(server.name))
         return toolsets
 
+    def _build_scene_narrator(
+        self,
+        toolkit: Toolkit,
+        recorder: "_HarnessToolkit",
+        sources: tuple[tuple[str, ...], tuple["McpServerSpec", ...]],
+    ) -> "_SceneNarrator":
+        """Build the background narrator agent and its filtered toolsets."""
+        observe, speak = sources
+        assert self.narrator_model is not None
+        narrator_toolkit = _HarnessToolkit(
+            toolkit,
+            dashboard_events=self.dashboard_events,
+            no_images=False,
+            capture=None,
+            sequential=True,
+        )
+        observe_toolset = narrator_toolkit.filtered(
+            lambda _ctx, tool_def: tool_def.name in observe
+        )
+        agent = Agent(
+            self.narrator_model,
+            name="scene_narrator",
+            system_prompt=_SCENE_NARRATOR_PROMPT,
+            output_type=str,
+            toolsets=[
+                observe_toolset,
+                *self._narrator_toolsets(narrator_toolkit, speak),
+            ],
+            model_settings=_build_model_settings(
+                self.narrator_model,
+                min(self.max_tokens, 1024),
+                "none",
+                parallel_tool_calls=False,
+            ),
+            capabilities=[
+                SlidingWindowCompaction(
+                    max_messages=40, max_fraction=0.8, keep_messages=20
+                ),
+            ],
+        )
+        return _SceneNarrator(agent, recorder, self.dashboard_events)
+
+    def _narrator_toolsets(
+        self,
+        recorder: "_HarnessToolkit",
+        servers: tuple["McpServerSpec", ...],
+    ) -> list[Any]:
+        """Expose only ``synthesize`` from each server to the narrator."""
+        if not servers:
+            return []
+        MCPToolset = _mcp_toolset()
+
+        from rpent.utils.mcp_servers import request_headers
+
+        toolsets: list[Any] = []
+        for server in servers:
+            toolset = MCPToolset(
+                server.url,
+                id=f"{server.name}_narrator",
+                headers=request_headers(server) or None,
+                process_tool_call=recorder.external_tool_hook(server.name),
+            )
+            toolset = toolset.filtered(
+                lambda _ctx, tool_def: tool_def.name == "synthesize"
+            )
+            toolsets.append(toolset.prefixed(server.name))
+        return toolsets
+
 
 def _build_model_settings(
-    model: Model, max_tokens: int, reasoning_effort: str | None = None
+    model: Model,
+    max_tokens: int,
+    reasoning_effort: str | None = None,
+    *,
+    parallel_tool_calls: bool = True,
 ) -> ModelSettings:
     """Enable parallel tool requests and preserve Anthropic prompt caching."""
     from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
@@ -322,7 +490,7 @@ def _build_model_settings(
     if isinstance(model, AnthropicModel):
         return AnthropicModelSettings(
             max_tokens=max_tokens,
-            parallel_tool_calls=True,
+            parallel_tool_calls=parallel_tool_calls,
             anthropic_cache_instructions=True,
             anthropic_cache_tool_definitions=True,
             anthropic_cache_messages=True,
@@ -330,12 +498,12 @@ def _build_model_settings(
     if isinstance(model, OpenAIChatModel) and reasoning_effort is not None:
         return OpenAIChatModelSettings(
             max_tokens=max_tokens,
-            parallel_tool_calls=True,
+            parallel_tool_calls=parallel_tool_calls,
             openai_reasoning_effort=OPENAI_REASONING_EFFORT_MAP.get(
                 reasoning_effort, reasoning_effort
             ),
         )
-    return ModelSettings(max_tokens=max_tokens, parallel_tool_calls=True)
+    return ModelSettings(max_tokens=max_tokens, parallel_tool_calls=parallel_tool_calls)
 
 
 def _external_result_text(result: Any) -> str:
@@ -409,12 +577,14 @@ class _HarnessToolkit(FunctionToolset):
         dashboard_events: DashboardEventSink,
         no_images: bool,
         capture: CapturingModel | None = None,
+        sequential: bool = False,
     ) -> None:
-        super().__init__(id="rpent")
+        super().__init__(id="rpent", sequential=sequential)
         self.toolkit = toolkit
         self.dashboard_events = dashboard_events
         self.no_images = no_images
         self.capture = capture
+        self.sequential = sequential
         self.finish_result: dict[str, Any] | None = None
         self.tool_calls = 0
         self.messages: list[dict[str, Any]] = []
@@ -462,6 +632,7 @@ class _HarnessToolkit(FunctionToolset):
                         description=spec.get("description"),
                         json_schema=spec["input_schema"],
                         takes_ctx=True,
+                        sequential=sequential,
                     )
                 )
 
@@ -626,6 +797,102 @@ class _HarnessToolkit(FunctionToolset):
         return result.to_text()
 
 
+class _SceneNarrator:
+    """Run one background narrator agent for the lifetime of a session."""
+
+    def __init__(
+        self,
+        agent: Agent,
+        recorder: "_HarnessToolkit",
+        dashboard_events: DashboardEventSink,
+    ) -> None:
+        self._agent = agent
+        self._recorder = recorder
+        self._events = dashboard_events
+        self._task: asyncio.Task[None] | None = None
+        self._prompt = "Start narrating the scene."
+
+    async def start(self, ctx: RunContext) -> str:
+        """Start narration once; return immediately so the main agent continues."""
+        capture = self._recorder.capture
+        with capture.tool(ctx) if capture is not None else nullcontext():
+            self._recorder._record_call("start_scene_narrator", {}, ctx)
+            if capture is not None:
+                capture.start()
+            if self._task is not None and not self._task.done():
+                text = "The scene narrator is already running."
+            else:
+                # An empty context keeps the main agent's current_tool_call
+                # ContextVar out of the narrator's tool executions.
+                self._task = asyncio.create_task(
+                    self._run(),
+                    name="scene-narrator",
+                    context=Context(),
+                )
+                text = "Scene narrator started; it runs until the episode ends."
+            self._recorder._record_result("start_scene_narrator", ctx, text)
+            if capture is not None:
+                capture.result(
+                    Payload(
+                        format="rpent.tool_result",
+                        data={"data": {"text": text}, "images": []},
+                        completeness="complete",
+                    )
+                )
+                capture.feedback(
+                    ctx,
+                    "pydantic_ai.tool_return",
+                    ToolReturn(return_value=text),
+                )
+                capture.finish("completed")
+            return text
+
+    async def stop(self) -> None:
+        """Cancel and wait for the background narrator, if it is running."""
+        task = self._task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("scene narrator cleanup failed")
+
+    async def _run(self) -> None:
+        self._emit("[scene_narrator] started")
+        try:
+            await self._agent.run(
+                self._prompt,
+                usage_limits=UsageLimits(request_limit=_NARRATOR_MAX_REQUESTS),
+                event_stream_handler=self._stream,
+            )
+        except asyncio.CancelledError:
+            raise
+        except UsageLimitExceeded:
+            logger.info(
+                "scene narrator reached its %d-request budget",
+                _NARRATOR_MAX_REQUESTS,
+            )
+            self._emit("[scene_narrator] request budget reached")
+        except Exception:
+            logger.exception("scene narrator failed")
+            self._emit("[scene_narrator] failed; see logs")
+        finally:
+            self._emit("[scene_narrator] stopped")
+
+    async def _stream(self, _ctx: RunContext, stream: AsyncIterator[Any]) -> None:
+        async for event in stream:
+            if isinstance(event, PartEndEvent) and isinstance(event.part, TextPart):
+                text = event.part.content.strip()
+                if text:
+                    self._emit(f"[scene_narrator] {text}")
+
+    def _emit(self, text: str) -> None:
+        self._events.emit(TranscriptEvent({"type": "text", "text": text}))
+
+
 class _Session(AbstractCapability):
     """Track native runs and bridge Dashboard input and events.
 
@@ -656,6 +923,7 @@ class _Session(AbstractCapability):
         self.run_done.set()
         self.cancellation: CancellationToken | None = None
         self.completions = 0
+        self.narrator: _SceneNarrator | None = None
 
     async def wrap_run(
         self, ctx: RunContext, *, handler: WrapRunHandler
@@ -869,6 +1137,8 @@ class _Session(AbstractCapability):
             # Stop new physical work before cancelling the SDK task. Toolkit
             # cancellation is cooperative, and must finish before solve returns.
             self.toolkit.stopping.set()
+            if self.narrator is not None:
+                await self.narrator.stop()
             if self.cancellation is not None:
                 self.cancellation.cancel()
             await cancel_and_wait(self.toolkit.cancel_active_and_wait)
