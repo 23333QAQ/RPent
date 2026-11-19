@@ -93,30 +93,6 @@ logger = get_logger("api")
 #: the main conversation's ``max_turns``.
 _NARRATOR_MAX_REQUESTS = 200
 
-_SCENE_NARRATOR_PROMPT = (
-    "You narrate a robot's camera view continuously. Repeat this round until "
-    "told to stop:\n"
-    "1. Call view_env_state(step=-1) or read_image for the latest observation "
-    "and look at agentview_high.png.\n"
-    "2. Write one Chinese sentence of at most 20 characters about the arm and "
-    "the main objects, without Markdown. If the view has not changed since "
-    "your last round, describe a different detail.\n"
-    "3. Call a text-to-speech tool whose name ends with '_synthesize' once with "
-    "exactly that sentence, and wait for it to return before starting the next "
-    "round.\n"
-    "Start the next round immediately, whether or not the view changed. Stop "
-    "and reply with a one-line summary only when view_env_state reports "
-    "terminated or truncated as true, or a tool reports that the session is "
-    "closed. Do not call any other tool."
-)
-
-_START_NARRATOR_DESCRIPTION = (
-    "Start the background scene narrator. It repeatedly reads the latest robot "
-    "observation and speaks one short Chinese sentence through the external "
-    "text-to-speech MCP tool until the episode ends. Call it once when the user "
-    "asks for spoken narration; do not wait for it."
-)
-
 
 class _RequestBudgetExhausted(Exception):
     """The conversation has used its configured model-request budget."""
@@ -275,11 +251,18 @@ class ApiAgentLoop(Planner):
                 else None
             )
             if narrator is not None:
+                description = (
+                    "Start the background scene narrator. It repeatedly reads "
+                    "the latest robot observation and speaks one short Chinese "
+                    "sentence through the external text-to-speech MCP tool until "
+                    "the episode ends. Call it once when the user asks for "
+                    "spoken narration; do not wait for it."
+                )
                 adapter.add_tool(
                     Tool(
                         narrator.start,
                         name="start_scene_narrator",
-                        description=_START_NARRATOR_DESCRIPTION,
+                        description=description,
                         takes_ctx=True,
                         sequential=True,
                     )
@@ -425,10 +408,26 @@ class ApiAgentLoop(Planner):
         observe_toolset = narrator_toolkit.filtered(
             lambda _ctx, tool_def: tool_def.name in observe
         )
+        prompt = (
+            "You narrate a robot's camera view continuously. Repeat this round "
+            "until told to stop:\n"
+            "1. Call view_env_state(step=-1) or read_image for the latest "
+            "observation and look at agentview_high.png.\n"
+            "2. Write one Chinese sentence of at most 20 characters about the "
+            "arm and the main objects, without Markdown. If the view has not "
+            "changed since your last round, describe a different detail.\n"
+            "3. Call a text-to-speech tool whose name ends with '_synthesize' "
+            "once with exactly that sentence, and wait for it to return before "
+            "starting the next round.\n"
+            "Start the next round immediately, whether or not the view changed. "
+            "Stop and reply with a one-line summary only when view_env_state "
+            "reports terminated or truncated as true, or a tool reports that "
+            "the session is closed. Do not call any other tool."
+        )
         agent = Agent(
             self.narrator_model,
             name="scene_narrator",
-            system_prompt=_SCENE_NARRATOR_PROMPT,
+            system_prompt=prompt,
             output_type=str,
             toolsets=[
                 observe_toolset,
