@@ -74,7 +74,7 @@ RPent 通过一个 CLI 参数选择 Agentic Planner 的后端：
 
 - ``--max-tokens`` —— 单次 LLM 回复的 token 上限（默认 ``8192``）。
 - ``--no-images`` —— 不向模型发送图片字节；纯文本模型必须加此参数。此时智能体只依赖文本状态推理，任务表现可能不够理想。
-- 将 ``RPENT_API_NARRATOR_MODEL`` 设为带提供商前缀的模型 id（例如 ``anthropic:claude-haiku-4-5``）后，会注册一个独立的 ``scene_narrator`` agent。主 agent 在任务要求播报时通过
+- 将 ``RPENT_API_SUBAGENT_MODEL`` 设为带提供商前缀的模型 id（例如 ``anthropic:claude-haiku-4-5``）后，会注册一个独立的 ``scene_narrator`` agent。主 agent 在任务要求播报时通过
   ``start_scene_narrator`` 启动它；它反复读取最新观测，写一句简短中文，并调用名为
   ``<server>_synthesize`` 的外部 MCP 工具。环境报告 ``terminated`` 或 ``truncated``、达到 200 次模型请求上限，或主运行结束时，它都会停止。它有独立的请求预算和压缩窗口，不占用 ``--max-turns``。因此本次运行需要一个在 ``planner_tools`` 中列出 ``synthesize`` 的服务（见 :ref:`external-mcp-servers`）。即使主 planner 使用 ``--no-images``，narrator 仍会接收观测图像。若 narrator 使用不同的提供商，``--base-url`` 不会应用给它；请设置 ``RPENT_API_NARRATOR_BASE_URL`` 或该提供商自己的地址变量。
 
@@ -101,7 +101,7 @@ RPent 为 Claude 规划会话关闭文件系统配置来源，因此不会自动
 - 非交互运行受 ``--planner-timeout-s`` 限制；默认读取 ``CELL_TIMEOUT_S``，未设置时为 ``1200`` 秒。``--tui`` 模式不应用这一时限。
 - 通过 ``--claude-code-max-budget-usd`` 设置美元预算（默认取 ``MAX_BUDGET_USD`` 环境变量或 ``10``）。
 - RPent 的依赖中已包含 Claude Agent SDK；该 SDK 自带 Claude Code 二进制文件，无需单独安装 CLI。认证通常使用 ``ANTHROPIC_API_KEY``，详见 `Claude Agent SDK 文档 <https://code.claude.com/docs/en/agent-sdk/overview>`_。
-- 设置 ``RPENT_CLAUDE_NARRATOR_MODEL``（例如 ``haiku``）后会注册一个 ``scene_narrator`` 子 agent。主 agent 在后台启动它后，它会反复读取最新的观测画面，用一句话描述，并通过外部 MCP ``synthesize`` 工具朗读出来，因此本次运行需要一个在 ``planner_tools`` 中列出 ``synthesize`` 的服务（见 :ref:`external-mcp-servers`）。每一轮都在上一轮合成返回后开始，不论画面是否变化，直到环境报告 ``terminated`` 或 ``truncated``，或子 agent 达到 200 轮上限。该子 agent 只能读取观测和调用 ``synthesize``，但与主会话共用 ``--claude-code-max-budget-usd`` 预算。只有主 agent 启动它时才会运行，所以需要在任务中提出播报要求。
+- 设置 ``RPENT_CLAUDE_SUBAGENT_MODEL``（例如 ``haiku``）后会注册一个 ``scene_narrator`` 子 agent。主 agent 在后台启动它后，它会反复读取最新的观测画面，用一句话描述，并通过外部 MCP ``synthesize`` 工具朗读出来，因此本次运行需要一个在 ``planner_tools`` 中列出 ``synthesize`` 的服务（见 :ref:`external-mcp-servers`）。每一轮都在上一轮合成返回后开始，不论画面是否变化，直到环境报告 ``terminated`` 或 ``truncated``，或子 agent 达到 200 轮上限。该子 agent 只能读取观测和调用 ``synthesize``，但与主会话共用 ``--claude-code-max-budget-usd`` 预算。只有主 agent 启动它时才会运行，所以需要在任务中提出播报要求。
 
 通过 Claude Code 使用本地模型
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

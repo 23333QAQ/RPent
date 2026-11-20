@@ -34,9 +34,11 @@ from rpent.planner.codex import (
     PROVIDER_ENV_KEY,
     PROVIDER_ID,
     CodexPlanner,
+    CodexSubAgent,
     _codex_mcp_config_overrides,
     _interrupt,
 )
+from rpent.planner.subagents.codex_scene_narrator import CodexSceneNarrator
 from rpent.planner.utils.http_mcp_server import (
     HttpMcpServer,
 )
@@ -490,16 +492,11 @@ def test_narrator_role_is_read_only_and_speaks_through_synthesize() -> None:
     lights = McpServerSpec(
         name="lights", url="http://127.0.0.1:1/mcp", planner_tools=("dim",)
     )
-    sources = codex_module._resolve_narrator_sources(
-        ObservingToolkit(), (NARRATOR_TTS,)
+    narrator = CodexSceneNarrator(
+        ObservingToolkit(), (lights, NARRATOR_TTS), model="haiku"
     )
-
-    text = codex_module._scene_narrator_role_toml(
-        sources=sources,
-        model="haiku",
-        mcp_url="http://127.0.0.1:9999/mcp/",
-        model_provider=PROVIDER_ID,
-        servers=(lights, NARRATOR_TTS),
+    text = narrator.render_config(
+        "http://127.0.0.1:9999/mcp/", model_provider=PROVIDER_ID
     )
 
     assert 'model = "haiku"' in text
@@ -522,14 +519,8 @@ def test_narrator_role_preserves_synthesize_server_headers() -> None:
         env_http_headers={"X-Site-Token": "SITE_TOKEN"},
         planner_tools="*",
     )
-    sources = codex_module._resolve_narrator_sources(ObservingToolkit(), (voice,))
-
-    text = codex_module._scene_narrator_role_toml(
-        sources=sources,
-        model=None,
-        mcp_url="http://127.0.0.1:9999/mcp/",
-        servers=(voice,),
-    )
+    narrator = CodexSceneNarrator(ObservingToolkit(), (voice,), model="fake")
+    text = narrator.render_config("http://127.0.0.1:9999/mcp/")
 
     assert 'mcp_servers.voice.enabled_tools = ["synthesize"]' in text
     assert 'mcp_servers.voice.http_headers = {"Authorization" = "Bearer token"}' in text
@@ -538,10 +529,37 @@ def test_narrator_role_preserves_synthesize_server_headers() -> None:
     )
 
 
+def test_subagent_registration_preserves_role_specific_capabilities(
+    tmp_path: Path,
+) -> None:
+    config = 'sandbox_mode = "workspace-write"\ntools.web_search = true\n'
+
+    class Researcher(CodexSubAgent):
+        name = "researcher"
+        description = "Research the task."
+
+        def render_config(
+            self, mcp_url: str, *, model_provider: str | None = None
+        ) -> str:
+            return config
+
+    overrides = Researcher().register(
+        tmp_path / "run" / "codex.out", "http://fake.invalid/mcp/"
+    )
+
+    role_path = tmp_path / "run" / "codex.researcher.toml"
+    assert role_path.read_text() == config
+    assert stat.S_IMODE(role_path.stat().st_mode) == 0o600
+    assert f"agents.researcher.config_file={json.dumps(str(role_path))}" in overrides
+    assert 'agents.researcher.description="Research the task."' in overrides
+    assert "features.multi_agent=true" in overrides
+
+
 def test_narrator_overrides_register_a_background_agent_type(tmp_path: Path) -> None:
     role_path = tmp_path / "codex.scene_narrator.toml"
 
-    overrides = codex_module._scene_narrator_overrides(role_path)
+    narrator = CodexSceneNarrator(ObservingToolkit(), (NARRATOR_TTS,), model="fake")
+    overrides = narrator.register(tmp_path / "codex.out", "http://fake.invalid/mcp/")
 
     assert overrides[0].startswith("agents.scene_narrator.description=")
     assert 'fork_turns=\\"none\\"' in overrides[0]
@@ -553,7 +571,9 @@ def test_narrator_overrides_register_a_background_agent_type(tmp_path: Path) -> 
     assert overrides[2] == "features.multi_agent=true"
 
 
-def test_build_config_writes_the_narrator_role_with_owner_only_permissions(
+@pytest.mark.parametrize("dashboard", [False, True], ids=["cli", "dashboard"])
+def test_solve_registers_the_narrator_role_with_owner_only_permissions(
+    dashboard: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -565,16 +585,25 @@ def test_build_config_writes_the_narrator_role_with_owner_only_permissions(
         model="fake-codex",
         dashboard_events=RecordingSink(),
         mcp_servers=(NARRATOR_TTS,),
-        narrator_model="haiku",
+        subagent_model="haiku",
     )
-    sources = codex_module._resolve_narrator_sources(
-        ObservingToolkit(), (NARRATOR_TTS,)
+    install_fake_backend(monkeypatch)
+    session_factory = Mock(
+        return_value=SimpleNamespace(run=AsyncMock(), close=AsyncMock(), error=None)
     )
-
-    config = planner._build_config(
-        "http://fake.invalid/mcp/",
-        output_path=tmp_path / "codex.out",
-        narrator_sources=sources,
+    monkeypatch.setattr(codex_module, "_CodexDashboardSession", session_factory)
+    result = planner.solve(
+        system_prompt="",
+        user_message="Narrate.",
+        toolkit=ObservingToolkit(),
+        max_turns=1,
+        dashboard_interaction=SimpleNamespace() if dashboard else None,
+    )
+    assert result.error is None
+    config = (
+        session_factory.call_args.kwargs["config"]
+        if dashboard
+        else FakeCodex.instances[0].config
     )
 
     role_path = tmp_path / "codex.scene_narrator.toml"
@@ -582,12 +611,13 @@ def test_build_config_writes_the_narrator_role_with_owner_only_permissions(
     assert stat.S_IMODE(role_path.stat().st_mode) == 0o600
     role_text = role_path.read_text()
     assert 'mcp_servers.tts.enabled_tools = ["synthesize"]' in role_text
+    assert 'mcp_servers.rpent.url = "http://fake.invalid/mcp/"' in role_text
     assert "move_to" not in role_text
     assert (
         f"agents.scene_narrator.config_file={json.dumps(str(role_path))}"
-        in config.config_overrides
+        in config["config_overrides"]
     )
-    assert "features.multi_agent=true" in config.config_overrides
+    assert "features.multi_agent=true" in config["config_overrides"]
 
 
 def test_build_config_keeps_existing_overrides_without_a_narrator(
@@ -597,21 +627,19 @@ def test_build_config_keeps_existing_overrides_without_a_narrator(
     monkeypatch.delenv("CODEX_BASE_URL", raising=False)
     planner = make_planner(tmp_path, RecordingSink())
 
-    config = planner._build_config(
-        "http://fake.invalid/mcp/", output_path=tmp_path / "codex.out"
-    )
+    config = planner._build_config("http://fake.invalid/mcp/")
 
     assert not any(entry.startswith("agents.") for entry in config.config_overrides)
     assert "features.multi_agent=true" not in config.config_overrides
 
 
-def test_build_planner_reads_codex_narrator_model_from_the_environment(
+def test_build_planner_reads_codex_subagent_model_from_the_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rpent.planner.base import build_planner
 
-    monkeypatch.setenv("RPENT_CODEX_NARRATOR_MODEL", "gpt-5.5")
+    monkeypatch.setenv("RPENT_CODEX_SUBAGENT_MODEL", "gpt-5.5")
 
     planner = build_planner(
         "codex",
@@ -622,7 +650,7 @@ def test_build_planner_reads_codex_narrator_model_from_the_environment(
         dashboard_events=RecordingSink(),
     )
 
-    assert planner._narrator_model == "gpt-5.5"
+    assert planner._subagent_model == "gpt-5.5"
 
 
 @pytest.mark.parametrize(
@@ -643,7 +671,7 @@ def test_narrator_sources_require_observation_and_speech(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        codex_module._resolve_narrator_sources(toolkit, servers)
+        CodexSceneNarrator(toolkit, servers, model="fake")
 
 
 def test_narrator_solve_rejects_missing_sources_before_starting_mcp(
@@ -658,7 +686,7 @@ def test_narrator_solve_rejects_missing_sources_before_starting_mcp(
         model="fake-codex",
         dashboard_events=RecordingSink(),
         mcp_servers=(NARRATOR_TTS,),
-        narrator_model="haiku",
+        subagent_model="haiku",
     )
 
     with pytest.raises(ValueError, match="view_env_state or read_image"):

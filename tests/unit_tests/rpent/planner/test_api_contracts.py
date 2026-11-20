@@ -46,11 +46,11 @@ from rpent.dashboard.events import RunStartedEvent, TranscriptEvent, UsageEvent
 from rpent.dashboard.state import DashboardState
 from rpent.planner.api_loop import (
     ApiAgentLoop,
+    ApiSubAgent,
     _external_result_text,
     _HarnessToolkit,
-    _resolve_narrator_sources,
-    _SceneNarrator,
 )
+from rpent.planner.subagents.api_scene_narrator import ApiSceneNarrator
 from rpent.session import EnvState, Payload
 from rpent.tools import Toolkit, ToolResult, common
 from rpent.tools import tool as declare_tool
@@ -121,7 +121,7 @@ def local_tools(monkeypatch):
     monkeypatch.setattr("rpent.tools.toolkit.substitute", lambda value: value)
     monkeypatch.setattr("rpent.planner.api_loop.substitute", lambda value: value)
     monkeypatch.setenv("PYDANTIC_AI_NO_BANNER", "1")
-    monkeypatch.delenv("RPENT_API_NARRATOR_MODEL", raising=False)
+    monkeypatch.delenv("RPENT_API_SUBAGENT_MODEL", raising=False)
     monkeypatch.delenv("RPENT_API_NARRATOR_BASE_URL", raising=False)
 
 
@@ -1855,7 +1855,9 @@ def test_narrator_sources_include_planner_observations_and_synthesize() -> None:
     events = Events()
     toolkit = NarratorToolkit(events)
 
-    observe, speak = _resolve_narrator_sources(toolkit, (NARRATOR_TTS,))
+    observe, speak = ApiSceneNarrator._resolve_narrator_sources(
+        toolkit, (NARRATOR_TTS,)
+    )
 
     assert observe == ("view_env_state", "read_image")
     assert speak == (NARRATOR_TTS,)
@@ -1863,7 +1865,7 @@ def test_narrator_sources_include_planner_observations_and_synthesize() -> None:
 
 def test_narrator_requires_a_server_listing_synthesize() -> None:
     with pytest.raises(ValueError, match="synthesize under planner_tools"):
-        _resolve_narrator_sources(NarratorToolkit(Events()), ())
+        ApiSceneNarrator._resolve_narrator_sources(NarratorToolkit(Events()), ())
 
 
 def test_narrator_agent_exposes_only_observation_and_tts_toolsets() -> None:
@@ -1876,24 +1878,27 @@ def test_narrator_agent_exposes_only_observation_and_tts_toolsets() -> None:
         model=TestModel(),
         dashboard_events=events,
         mcp_servers=(NARRATOR_TTS,),
-        narrator_model=TestModel(),
+        subagent_model=TestModel(),
     )
     adapter = _HarnessToolkit(toolkit, dashboard_events=events, no_images=False)
-    sources = _resolve_narrator_sources(toolkit, (NARRATOR_TTS,))
+    narrator = ApiSceneNarrator(planner, adapter)
 
-    narrator = planner._build_scene_narrator(toolkit, adapter, sources)
-
-    toolsets = narrator._agent._user_toolsets
+    toolsets = narrator._toolsets
     assert narrator._agent.name == "scene_narrator"
     assert len(toolsets) == 2
     assert isinstance(toolsets[0], FilteredToolset)
-    assert isinstance(toolsets[1], PrefixedToolset)
-    assert toolsets[1].prefix == "tts"
-    assert isinstance(toolsets[1].wrapped, FilteredToolset)
+    speech = toolsets[1]
+    assert isinstance(speech, FilteredToolset)
+    assert isinstance(speech.wrapped, PrefixedToolset)
+    assert speech.wrapped.prefix == "tts"
+    assert speech.filter_func(None, SimpleNamespace(name="tts_synthesize"))
+    assert not speech.filter_func(None, SimpleNamespace(name="tts_preview_synthesize"))
 
 
 def test_start_scene_narrator_is_idempotent_and_stops_the_task() -> None:
     class BlockingAgent:
+        name = "scene_narrator"
+
         def __init__(self) -> None:
             self.calls = 0
             self.started = asyncio.Event()
@@ -1914,7 +1919,9 @@ def test_start_scene_narrator_is_idempotent_and_stops_the_task() -> None:
 
     async def scenario() -> tuple[str, str, int]:
         agent = BlockingAgent()
-        narrator = _SceneNarrator(agent, Recorder(), Events())
+        narrator = ApiSubAgent(
+            agent, Recorder(), Events(), prompt="Start", request_limit=2
+        )
         ctx = SimpleNamespace(tool_call_id="call-1")
 
         first = await narrator.start(ctx)
@@ -1963,12 +1970,16 @@ def test_start_scene_narrator_records_a_completed_tool_call() -> None:
             return None
 
     class IdleAgent:
+        name = "scene_narrator"
+
         async def run(self, *args: Any, **kwargs: Any) -> None:
             return None
 
     async def scenario() -> tuple[Capture, str]:
         recorder = Recorder()
-        narrator = _SceneNarrator(IdleAgent(), recorder, Events())
+        narrator = ApiSubAgent(
+            IdleAgent(), recorder, Events(), prompt="Start", request_limit=2
+        )
         text = await narrator.start(SimpleNamespace(tool_call_id="call-1"))
         await narrator._task
         return recorder.capture, text
@@ -2005,12 +2016,11 @@ def test_solve_starts_narrator_without_counting_its_usage(tmp_path) -> None:
         model=FunctionModel(stream_function=main_stream),
         dashboard_events=events,
         mcp_servers=(NARRATOR_TTS,),
-        narrator_model=FunctionModel(stream_function=narrator_stream),
+        subagent_model=FunctionModel(stream_function=narrator_stream),
     )
     # Both the main and narrator MCP toolsets are covered separately; avoid a
     # real connection for this lifecycle/usage test.
-    planner._external_toolsets = lambda adapter: []
-    planner._narrator_toolsets = lambda recorder, servers: []
+    planner._external_toolsets = lambda recorder, **kwargs: []
 
     result = planner.solve(
         system_prompt="Use the robot toolkit. Finish when done.",
@@ -2038,7 +2048,7 @@ def test_solve_rejects_narrator_without_a_synthesize_server() -> None:
     planner = ApiAgentLoop(
         model=TestModel(),
         dashboard_events=Events(),
-        narrator_model=TestModel(),
+        subagent_model=TestModel(),
     )
 
     with pytest.raises(ValueError, match="synthesize under planner_tools"):
@@ -2050,7 +2060,7 @@ def test_solve_rejects_narrator_without_a_synthesize_server() -> None:
         )
 
 
-def test_build_planner_reads_the_api_narrator_model(
+def test_build_planner_reads_the_api_subagent_model(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from rpent.planner import base as planner_base
@@ -2062,7 +2072,7 @@ def test_build_planner_reads_the_api_narrator_model(
         return TestModel()
 
     monkeypatch.setattr(planner_base, "build_api_model", fake_build_api_model)
-    monkeypatch.setenv("RPENT_API_NARRATOR_MODEL", "openai:gpt-5.5-mini")
+    monkeypatch.setenv("RPENT_API_SUBAGENT_MODEL", "openai:gpt-5.5-mini")
 
     planner = planner_base.build_planner(
         "api",
@@ -2074,7 +2084,7 @@ def test_build_planner_reads_the_api_narrator_model(
         base_url="https://proxy.example",
     )
 
-    assert planner.narrator_model is not None
+    assert planner.subagent_model is not None
     assert calls == [
         ("openai:gpt-5.5", "https://proxy.example"),
         ("openai:gpt-5.5-mini", "https://proxy.example"),
@@ -2093,7 +2103,7 @@ def test_build_planner_does_not_apply_a_foreign_base_url_to_the_narrator(
         return TestModel()
 
     monkeypatch.setattr(planner_base, "build_api_model", fake_build_api_model)
-    monkeypatch.setenv("RPENT_API_NARRATOR_MODEL", "anthropic:claude-haiku-4-5")
+    monkeypatch.setenv("RPENT_API_SUBAGENT_MODEL", "anthropic:claude-haiku-4-5")
 
     planner_base.build_planner(
         "api",

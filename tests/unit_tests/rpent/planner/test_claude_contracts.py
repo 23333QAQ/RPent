@@ -295,7 +295,7 @@ def narrator_planner(tmp_path: Path, **kwargs: Any) -> ClaudeCodePlanner:
 def test_narrator_subagent_is_read_only_and_runs_in_the_background(
     tmp_path: Path,
 ) -> None:
-    planner = narrator_planner(tmp_path, mcp_servers=(TTS,), narrator_model="haiku")
+    planner = narrator_planner(tmp_path, mcp_servers=(TTS,), subagent_model="haiku")
 
     options = planner._build_options(
         claude_agent_sdk, toolkit=ObservingToolkit(), max_turns=4
@@ -313,7 +313,7 @@ def test_narrator_subagent_is_read_only_and_runs_in_the_background(
     assert "mcp__rpent__move_to" not in narrator.tools
 
 
-def test_without_narrator_model_options_are_unchanged(tmp_path: Path) -> None:
+def test_without_subagent_model_options_are_unchanged(tmp_path: Path) -> None:
     planner = narrator_planner(tmp_path, mcp_servers=(TTS,))
 
     options = planner._build_options(
@@ -333,7 +333,7 @@ def test_narrator_speaks_only_through_servers_offering_synthesize(
     )
     voice = McpServerSpec(name="voice", url="http://127.0.0.1:2/mcp", planner_tools="*")
     planner = narrator_planner(
-        tmp_path, mcp_servers=(lights, TTS, voice), narrator_model="haiku"
+        tmp_path, mcp_servers=(lights, TTS, voice), subagent_model="haiku"
     )
 
     options = planner._build_options(
@@ -362,18 +362,18 @@ def test_narrator_speaks_only_through_servers_offering_synthesize(
 def test_narrator_requires_observation_and_speech_tools(
     tmp_path: Path, servers, toolkit, message
 ) -> None:
-    planner = narrator_planner(tmp_path, mcp_servers=servers, narrator_model="haiku")
+    planner = narrator_planner(tmp_path, mcp_servers=servers, subagent_model="haiku")
 
     with pytest.raises(ValueError, match=message):
         planner._build_options(claude_agent_sdk, toolkit=toolkit, max_turns=4)
 
 
-def test_build_planner_reads_narrator_model_from_the_environment(
+def test_build_planner_reads_subagent_model_from_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from rpent.planner.base import build_planner
 
-    monkeypatch.setenv("RPENT_CLAUDE_NARRATOR_MODEL", "haiku")
+    monkeypatch.setenv("RPENT_CLAUDE_SUBAGENT_MODEL", "haiku")
 
     planner = build_planner(
         "claude_code",
@@ -384,7 +384,7 @@ def test_build_planner_reads_narrator_model_from_the_environment(
         dashboard_events=RecordingSink(),
     )
 
-    assert planner._narrator_model == "haiku"
+    assert planner._subagent_model == "haiku"
 
 
 def test_in_process_mcp_bridge_maps_schema_dispatch_and_errors() -> None:

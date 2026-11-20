@@ -93,7 +93,7 @@ Relevant ``api`` planner knobs:
 - ``--no-images`` — never send image bytes; this is required for
   text-only models. The agent then reasons from textual state alone,
   so task performance may not be satisfactory.
-- Setting ``RPENT_API_NARRATOR_MODEL`` to a provider-prefixed model id (for
+- Setting ``RPENT_API_SUBAGENT_MODEL`` to a provider-prefixed model id (for
   example ``anthropic:claude-haiku-4-5``) registers a separate
   ``scene_narrator`` agent. The main agent starts it with
   ``start_scene_narrator`` when narration is requested; it repeatedly reads the
@@ -144,7 +144,7 @@ Notes:
   Authentication normally uses ``ANTHROPIC_API_KEY``. See the
   `Claude Agent SDK docs
   <https://code.claude.com/docs/en/agent-sdk/overview>`_.
-- Setting ``RPENT_CLAUDE_NARRATOR_MODEL`` (for example ``haiku``) registers a
+- Setting ``RPENT_CLAUDE_SUBAGENT_MODEL`` (for example ``haiku``) registers a
   ``scene_narrator`` subagent. Once the main agent launches it in the
   background, it repeatedly reads the latest observation, describes it in one
   sentence, and speaks it through an external MCP ``synthesize`` tool, so the

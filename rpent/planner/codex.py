@@ -33,6 +33,8 @@ import queue
 import tempfile
 import threading
 import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -65,19 +67,13 @@ from rpent.utils.logging import get_logger
 if TYPE_CHECKING:
     from rpent.utils.mcp_servers import McpServerSpec
 
+_SessionConfigBuilder = Callable[[str, Path], openai_codex.CodexConfig]
+
 logger = get_logger("codex")
 
 PROVIDER_ID = "rpent_proxy"
 PROVIDER_ENV_KEY = "RPENT_CODEX_PROVIDER_KEY"
 _LOOPBACK_NO_PROXY_HOSTS = ("127.0.0.1", "localhost")
-
-
-@dataclass(frozen=True)
-class _NarratorSources:
-    """Tools and servers one scene narrator may use."""
-
-    observe: tuple[str, ...]
-    speak: tuple["McpServerSpec", ...]
 
 
 def _codex_environment() -> dict[str, str]:
@@ -115,12 +111,12 @@ class CodexPlanner(Planner):
         model: str | None = None,
         reasoning_effort: str = "none",
         mcp_servers: tuple["McpServerSpec", ...] = (),
-        narrator_model: str | None = None,
+        subagent_model: str | None = None,
     ):
         """Initialize the Codex SDK backend.
 
         Args:
-            narrator_model: Model for the ``scene_narrator`` agent role, which
+            subagent_model: Model for the ``scene_narrator`` agent role, which
                 describes camera frames and speaks them through an external
                 MCP ``synthesize`` tool. ``None`` registers no role.
         """
@@ -135,7 +131,7 @@ class CodexPlanner(Planner):
         self._service_tier = os.environ.get("CODEX_SERVICE_TIER", None)
         self._dashboard_events = dashboard_events
         self._mcp_servers = mcp_servers
-        self._narrator_model = narrator_model
+        self._subagent_model = subagent_model
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         self._thread_options = {
@@ -176,11 +172,28 @@ class CodexPlanner(Planner):
             else None
         )
         prompt = f"{system_prompt}\n\n{user_message}" if system_prompt else user_message
-        narrator_sources = (
-            _resolve_narrator_sources(toolkit, self._mcp_servers)
-            if self._narrator_model
-            else None
-        )
+        subagent = None
+        if self._subagent_model:
+            from rpent.planner.subagents.codex_scene_narrator import CodexSceneNarrator
+
+            subagent = CodexSceneNarrator(
+                toolkit, self._mcp_servers, model=self._subagent_model
+            )
+
+        def session_config(mcp_url: str, output_path: Path) -> openai_codex.CodexConfig:
+            overrides = (
+                subagent.register(
+                    output_path,
+                    mcp_url,
+                    model_provider=PROVIDER_ID if self._base_url else None,
+                )
+                if subagent is not None
+                else None
+            )
+            return self._build_config(
+                mcp_url, trace_root=trace_root, agent_overrides=overrides
+            )
+
         result: PlannerResult | None = None
         terminal_cleanup: threading.Event | None = None
         try:
@@ -192,8 +205,7 @@ class CodexPlanner(Planner):
                         toolkit=toolkit,
                         max_turns=max_turns,
                         interaction=dashboard_interaction,
-                        trace_root=trace_root,
-                        narrator_sources=narrator_sources,
+                        build_config=session_config,
                     )
                 )
             else:
@@ -203,9 +215,8 @@ class CodexPlanner(Planner):
                     toolkit=toolkit,
                     max_turns=max_turns,
                     input_queue=input_queue,
-                    trace_root=trace_root,
+                    build_config=session_config,
                     cleanup_done=terminal_cleanup,
-                    narrator_sources=narrator_sources,
                 )
             return result
         finally:
@@ -233,9 +244,8 @@ class CodexPlanner(Planner):
         toolkit: Toolkit,
         max_turns: int,
         input_queue: queue.Queue[str | None] | None,
-        trace_root: Path | None,
+        build_config: _SessionConfigBuilder,
         cleanup_done: threading.Event,
-        narrator_sources: _NarratorSources | None = None,
     ) -> PlannerResult:
         """Run a terminal session with a bounded wait for worker cleanup."""
         output_path, raw_stream_path, last_message_path = self._output_paths()
@@ -277,8 +287,7 @@ class CodexPlanner(Planner):
                     mcp_url,
                     toolkit,
                     input_queue,
-                    trace_root,
-                    narrator_sources,
+                    build_config,
                 ),
                 name="codex-sdk",
                 daemon=True,
@@ -365,20 +374,12 @@ class CodexPlanner(Planner):
         state: dict[str, Any],
         mcp_url: str,
         toolkit: Toolkit,
-        input_queue: "queue.Queue[str | None] | None" = None,
-        trace_root: Path | None = None,
-        narrator_sources: _NarratorSources | None = None,
+        input_queue: queue.Queue[str | None] | None,
+        build_config: _SessionConfigBuilder,
     ) -> None:
         try:
             chunks: list[str] = []
-            with openai_codex.Codex(
-                config=self._build_config(
-                    mcp_url,
-                    trace_root=trace_root,
-                    output_path=output_path,
-                    narrator_sources=narrator_sources,
-                )
-            ) as codex:
+            with openai_codex.Codex(config=build_config(mcp_url, output_path)) as codex:
                 state["codex"] = codex
                 if state.get("stop_requested"):
                     return
@@ -479,8 +480,7 @@ class CodexPlanner(Planner):
         toolkit: Toolkit,
         max_turns: int,
         interaction: DashboardInteractionPort,
-        trace_root: Path | None = None,
-        narrator_sources: _NarratorSources | None = None,
+        build_config: _SessionConfigBuilder,
     ) -> PlannerResult:
         """Run a controllable sequence of turns on one Codex thread."""
         output_path, raw_stream_path, last_message_path = self._output_paths()
@@ -530,12 +530,7 @@ class CodexPlanner(Planner):
                     ),
                 )
                 session = _CodexDashboardSession(
-                    config=self._build_config(
-                        mcp_url,
-                        trace_root=trace_root,
-                        output_path=output_path,
-                        narrator_sources=narrator_sources,
-                    ),
+                    config=build_config(mcp_url, output_path),
                     thread_options=self._thread_options,
                     turn_options=self._turn_options,
                     recorder=recorder,
@@ -599,25 +594,8 @@ class CodexPlanner(Planner):
         mcp_url: str,
         *,
         trace_root: Path | None = None,
-        output_path: Path | None = None,
-        narrator_sources: _NarratorSources | None = None,
-    ) -> Any:
-        narrator: list[str] | None = None
-        if narrator_sources is not None:
-            base = output_path or Path(self._output_dir) / "codex.out"
-            base.parent.mkdir(parents=True, exist_ok=True)
-            role_path = base.with_name(f"{base.stem}.scene_narrator.toml")
-            if not role_path.is_absolute():
-                role_path = role_path.resolve()
-            role_text = _scene_narrator_role_toml(
-                sources=narrator_sources,
-                model=self._narrator_model,
-                mcp_url=mcp_url,
-                model_provider=PROVIDER_ID if self._base_url else None,
-                servers=self._mcp_servers,
-            )
-            _write_scene_narrator_role(role_path, role_text)
-            narrator = _scene_narrator_overrides(role_path)
+        agent_overrides: list[str] | None = None,
+    ) -> openai_codex.CodexConfig:
         return build_codex_config(
             mcp_url=mcp_url,
             base_url=self._base_url,
@@ -625,7 +603,7 @@ class CodexPlanner(Planner):
             cwd=self._repo_root,
             trace_root=trace_root,
             mcp_servers=self._mcp_servers,
-            narrator=narrator,
+            agent_overrides=agent_overrides,
         )
 
 
@@ -1022,144 +1000,34 @@ class _Recorder:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_narrator_sources(
-    toolkit: Toolkit, mcp_servers: tuple["McpServerSpec", ...]
-) -> _NarratorSources:
-    """Find the observation tools and synthesis servers a narrator may use.
+class CodexSubAgent(ABC):
+    """Define and register a native Codex role for one session."""
 
-    Raises:
-        ValueError: If the toolkit has no observation tool or no attached
-            planner-layer server lists ``synthesize``.
-    """
-    from rpent.utils.mcp_servers import ALL_TOOLS
+    name: str
+    description: str
 
-    names = {declaration.name for declaration in toolkit.list_tools()}
-    observe = tuple(name for name in ("view_env_state", "read_image") if name in names)
-    if not observe:
-        raise ValueError(
-            "the scene_narrator subagent needs a view_env_state or read_image tool"
+    @abstractmethod
+    def render_config(self, mcp_url: str, *, model_provider: str | None = None) -> str:
+        """Return the role's TOML configuration for this session."""
+
+    def register(
+        self, output_path: Path, mcp_url: str, *, model_provider: str | None = None
+    ) -> list[str]:
+        """Write a private role file and return its Codex config overrides."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        role_path = output_path.with_name(
+            f"{output_path.stem}.{self.name}.toml"
+        ).resolve()
+        # Role configs can contain literal authentication headers.
+        role_path.write_text(
+            self.render_config(mcp_url, model_provider=model_provider), encoding="utf-8"
         )
-    speak = tuple(
-        server
-        for server in mcp_servers
-        if server.planner_tools == ALL_TOOLS
-        or (server.planner_tools and "synthesize" in server.planner_tools)
-    )
-    if not speak:
-        raise ValueError(
-            "the scene_narrator subagent needs an external MCP server listing "
-            "synthesize under planner_tools"
-        )
-    return _NarratorSources(observe=observe, speak=speak)
-
-
-def _scene_narrator_role_toml(
-    *,
-    sources: _NarratorSources,
-    model: str | None,
-    mcp_url: str,
-    model_provider: str | None = None,
-    servers: tuple["McpServerSpec", ...] = (),
-) -> str:
-    """Render the Codex agent-role file for the scene narrator.
-
-    The role may only read observations and call an external ``synthesize``
-    tool; it never receives robot action tools. Each MCP entry repeats the
-    run's endpoint so the role keeps working whether Codex merges the role
-    config with the parent or applies it as a replacement. The caller writes
-    the file with owner-only permissions because literal headers may be
-    present.
-    """
-    from rpent.utils.mcp_servers import RESERVED_SERVER_NAME
-
-    prompt = (
-        "You narrate a robot's camera view continuously. Repeat this round "
-        "until told to stop:\n"
-        "1. Call view_env_state(step=-1) or read_image for the latest "
-        "observation and look at agentview_high.png.\n"
-        "2. Write one Chinese sentence of at most 20 characters about the "
-        "arm and the main objects, without Markdown. If the view has not "
-        "changed since your last round, describe a different detail.\n"
-        "3. Call synthesize once with exactly that sentence and wait for it "
-        "to return before starting the next round.\n"
-        "Start the next round immediately, whether or not the view changed. "
-        "Stop and reply with a one-line summary only when view_env_state "
-        "reports terminated or truncated as true, or a tool reports that "
-        "the session is closed. Do not call any other tool."
-    )
-    lines: list[str] = []
-    if model:
-        lines.append(f"model = {_toml_value(model)}")
-        if model_provider:
-            lines.append(f"model_provider = {_toml_value(model_provider)}")
-    lines.extend(
-        [
-            'sandbox_mode = "read-only"',
-            'approval_policy = "never"',
-            "tools.web_search = false",
-            f"developer_instructions = {_toml_value(prompt)}",
-            f"mcp_servers.{RESERVED_SERVER_NAME}.url = {_toml_value(mcp_url)}",
-            f"mcp_servers.{RESERVED_SERVER_NAME}.enabled_tools = "
-            f"{_toml_value(list(sources.observe))}",
+        role_path.chmod(0o600)
+        return [
+            f"agents.{self.name}.description={_toml_value(self.description)}",
+            f"agents.{self.name}.config_file={_toml_value(str(role_path))}",
+            "features.multi_agent=true",
         ]
-    )
-    for server in sources.speak:
-        lines.extend(
-            [
-                f"mcp_servers.{server.name}.url = {_toml_value(server.url)}",
-                f"mcp_servers.{server.name}.enabled_tools = "
-                f"{_toml_value(['synthesize'])}",
-            ]
-        )
-        if server.env_http_headers:
-            lines.append(
-                f"mcp_servers.{server.name}.env_http_headers = "
-                f"{_toml_value(server.env_http_headers)}"
-            )
-        if server.headers:
-            lines.append(
-                f"mcp_servers.{server.name}.http_headers = "
-                f"{_toml_value(server.headers)}"
-            )
-    speak_names = {server.name for server in sources.speak}
-    for server in servers:
-        if (
-            server.planner_tools is None
-            or server.name in speak_names
-            or server.name == RESERVED_SERVER_NAME
-        ):
-            continue
-        lines.extend(
-            [
-                f"mcp_servers.{server.name}.url = {_toml_value(server.url)}",
-                f"mcp_servers.{server.name}.enabled = false",
-            ]
-        )
-    return "\n".join(lines) + "\n"
-
-
-def _scene_narrator_overrides(role_path: Path) -> list[str]:
-    """Return Codex config overrides that register the narrator role."""
-    name = "scene_narrator"
-    description = (
-        "Keeps narrating the robot's camera view aloud until the episode ends. "
-        "Launch it once, in the background, when asked to narrate; do not launch "
-        "a second one while it runs. If it returns before the task is finished, "
-        "launch it again. It cannot move the robot. Spawn it with "
-        f'agent_type="{name}" and fork_turns="none", and do not wait for '
-        "it; continue the task."
-    )
-    return [
-        f"agents.{name}.description={_toml_value(description)}",
-        f"agents.{name}.config_file={_toml_value(str(role_path))}",
-        "features.multi_agent=true",
-    ]
-
-
-def _write_scene_narrator_role(path: Path, text: str) -> None:
-    """Write the role file readable only by its owner."""
-    path.write_text(text, encoding="utf-8")
-    path.chmod(0o600)
 
 
 def build_codex_config(
@@ -1170,7 +1038,7 @@ def build_codex_config(
     cwd: str,
     trace_root: Path | None = None,
     mcp_servers: tuple["McpServerSpec", ...] = (),
-    narrator: list[str] | None = None,
+    agent_overrides: list[str] | None = None,
 ) -> Any:
     """Build the Codex child config with optional native rollout tracing.
 
@@ -1185,8 +1053,7 @@ def build_codex_config(
         mcp_servers: Planner-layer streamable-HTTP MCP servers to attach
             alongside RPent's own, each rendered as an ``mcp_servers.<name>``
             table. Specs without ``planner_tools`` are skipped.
-        narrator: Optional config overrides registering the scene narrator
-            agent role.
+        agent_overrides: Optional config overrides registering native agent roles.
 
     Returns:
         The ``openai_codex.CodexConfig`` to open a session with.
@@ -1199,8 +1066,8 @@ def build_codex_config(
     config_overrides = _codex_mcp_config_overrides(
         mcp_url=mcp_url, base_url=base_url, mcp_servers=mcp_servers
     )
-    if narrator is not None:
-        config_overrides.extend(narrator)
+    if agent_overrides is not None:
+        config_overrides.extend(agent_overrides)
     # Project development instructions and skills are excluded from planner context.
     config_overrides.append("project_doc_max_bytes=0")
     disabled_skills = [

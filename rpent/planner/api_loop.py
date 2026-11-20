@@ -85,13 +85,11 @@ from rpent.utils.logging import get_logger
 from rpent.utils.templates import substitute
 
 if TYPE_CHECKING:
+    from pydantic_ai.toolsets import AbstractToolset
+
     from rpent.utils.mcp_servers import McpServerSpec
 
 logger = get_logger("api")
-
-#: Model-request budget for one scene narration session. This is independent of
-#: the main conversation's ``max_turns``.
-_NARRATOR_MAX_REQUESTS = 200
 
 
 class _RequestBudgetExhausted(Exception):
@@ -102,49 +100,6 @@ def _is_response_truncation(exc: UnexpectedModelBehavior) -> bool:
     """Match the SDK's token-limit-without-usable-output failure."""
     message = str(exc).lower()
     return "token limit" in message and "before any response was generated" in message
-
-
-def _mcp_toolset() -> Any:
-    """Return the optional pydantic-ai MCP toolset class."""
-    try:
-        from pydantic_ai.mcp import MCPToolset
-    except ImportError as exc:
-        raise RuntimeError(
-            "attaching external MCP servers to the 'api' planner requires "
-            "the pydantic-ai MCP client; install it with "
-            '`pip install "pydantic-ai-slim[mcp]"`.'
-        ) from exc
-    return MCPToolset
-
-
-def _resolve_narrator_sources(
-    toolkit: Toolkit, mcp_servers: tuple["McpServerSpec", ...]
-) -> tuple[tuple[str, ...], tuple["McpServerSpec", ...]]:
-    """Find the observation tools and synthesis servers a narrator may use.
-
-    Raises:
-        ValueError: If no attached planner-layer server lists ``synthesize``.
-    """
-    from rpent.utils.mcp_servers import ALL_TOOLS
-
-    names = {declaration.name for declaration in toolkit.list_tools()}
-    observe = tuple(
-        name
-        for name in ("view_env_state", "read_image")
-        if name in names or name == "read_image"
-    )
-    speak = tuple(
-        server
-        for server in mcp_servers
-        if server.planner_tools == ALL_TOOLS
-        or (server.planner_tools and "synthesize" in server.planner_tools)
-    )
-    if not speak:
-        raise ValueError(
-            "the scene_narrator subagent needs an external MCP server listing "
-            "synthesize under planner_tools"
-        )
-    return observe, speak
 
 
 class ApiAgentLoop(Planner):
@@ -161,12 +116,12 @@ class ApiAgentLoop(Planner):
         timeout_s: float = 1200,
         interactive: bool = False,
         mcp_servers: tuple["McpServerSpec", ...] = (),
-        narrator_model: Model | None = None,
+        subagent_model: Model | None = None,
     ) -> None:
         """Initialize the API planner.
 
         Args:
-            narrator_model: Optional model for a background ``scene_narrator``
+            subagent_model: Optional model for a background ``scene_narrator``
                 agent. ``None`` disables narration and leaves the main agent
                 unchanged.
         """
@@ -175,7 +130,7 @@ class ApiAgentLoop(Planner):
         if max_tokens < 1 or timeout_s <= 0:
             raise ValueError("max_tokens and timeout_s must be positive")
         self.model = model
-        self.narrator_model = narrator_model
+        self.subagent_model = subagent_model
         self.dashboard_events = dashboard_events
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
@@ -229,11 +184,6 @@ class ApiAgentLoop(Planner):
             if state is not None and state.get_task() is not None
             else None
         )
-        narrator_sources = (
-            _resolve_narrator_sources(toolkit, self.mcp_servers)
-            if self.narrator_model is not None
-            else None
-        )
         try:
             # The adapter registers one pydantic-ai tool per Toolkit tool, so a
             # robot tool that reuses a planner-owned name (read_image) fails
@@ -245,28 +195,14 @@ class ApiAgentLoop(Planner):
                 no_images=self.no_images,
                 capture=capture,
             )
-            narrator = (
-                self._build_scene_narrator(toolkit, adapter, narrator_sources)
-                if narrator_sources is not None
-                else None
-            )
-            if narrator is not None:
-                description = (
-                    "Start the background scene narrator. It repeatedly reads "
-                    "the latest robot observation and speaks one short Chinese "
-                    "sentence through the external text-to-speech MCP tool until "
-                    "the episode ends. Call it once when the user asks for "
-                    "spoken narration; do not wait for it."
-                )
-                adapter.add_tool(
-                    Tool(
-                        narrator.start,
-                        name="start_scene_narrator",
-                        description=description,
-                        takes_ctx=True,
-                        sequential=True,
-                    )
-                )
+            subagent = None
+            if self.subagent_model is not None:
+                from rpent.planner.subagents.api_scene_narrator import ApiSceneNarrator
+
+                subagent = ApiSceneNarrator(self, adapter)
+                subagent.register()
+        except ApiSubAgent.ConfigurationError:
+            raise
         except Exception as exc:
             logger.exception("Harness toolkit construction failed")
             return PlannerResult(
@@ -275,7 +211,7 @@ class ApiAgentLoop(Planner):
         session = _Session(
             adapter, conversation_id, max_turns, interactive=self.interactive
         )
-        session.narrator = narrator
+        session.subagent = subagent
         if interaction is not None:
             session.control = DashboardPlannerControl(
                 interaction=interaction,
@@ -352,7 +288,13 @@ class ApiAgentLoop(Planner):
             stop_reason=session.stop_reason,
         )
 
-    def _external_toolsets(self, recorder: "_HarnessToolkit") -> list[Any]:
+    def _external_toolsets(
+        self,
+        recorder: "_HarnessToolkit",
+        *,
+        servers: tuple["McpServerSpec", ...] | None = None,
+        id_suffix: str = "",
+    ) -> list[Any]:
         """Build one MCP toolset per planner-layer external server.
 
         Each server's tools are prefixed with its name (``<server>_<tool>``) so
@@ -364,12 +306,22 @@ class ApiAgentLoop(Planner):
         pydantic-ai MCP client is an optional import: it is only needed when a
         server is actually attached.
         """
-        servers = [
-            server for server in self.mcp_servers if server.planner_tools is not None
-        ]
+        if servers is None:
+            servers = tuple(
+                server
+                for server in self.mcp_servers
+                if server.planner_tools is not None
+            )
         if not servers:
             return []
-        MCPToolset = _mcp_toolset()
+        try:
+            from pydantic_ai.mcp import MCPToolset
+        except ImportError as exc:
+            raise RuntimeError(
+                "attaching external MCP servers to the 'api' planner requires "
+                "the pydantic-ai MCP client; install it with "
+                '`pip install "pydantic-ai-slim[mcp]"`.'
+            ) from exc
 
         from rpent.utils.mcp_servers import ALL_TOOLS, request_headers
 
@@ -377,7 +329,7 @@ class ApiAgentLoop(Planner):
         for server in servers:
             toolset = MCPToolset(
                 server.url,
-                id=server.name,
+                id=f"{server.name}{id_suffix}",
                 headers=request_headers(server) or None,
                 process_tool_call=recorder.external_tool_hook(server.name),
             )
@@ -386,90 +338,6 @@ class ApiAgentLoop(Planner):
                 toolset = toolset.filtered(
                     lambda _ctx, tool_def, allowed=allowed: tool_def.name in allowed
                 )
-            toolsets.append(toolset.prefixed(server.name))
-        return toolsets
-
-    def _build_scene_narrator(
-        self,
-        toolkit: Toolkit,
-        recorder: "_HarnessToolkit",
-        sources: tuple[tuple[str, ...], tuple["McpServerSpec", ...]],
-    ) -> "_SceneNarrator":
-        """Build the background narrator agent and its filtered toolsets."""
-        observe, speak = sources
-        assert self.narrator_model is not None
-        narrator_toolkit = _HarnessToolkit(
-            toolkit,
-            dashboard_events=self.dashboard_events,
-            no_images=False,
-            capture=None,
-            sequential=True,
-        )
-        observe_toolset = narrator_toolkit.filtered(
-            lambda _ctx, tool_def: tool_def.name in observe
-        )
-        prompt = (
-            "You narrate a robot's camera view continuously. Repeat this round "
-            "until told to stop:\n"
-            "1. Call view_env_state(step=-1) or read_image for the latest "
-            "observation and look at agentview_high.png.\n"
-            "2. Write one Chinese sentence of at most 20 characters about the "
-            "arm and the main objects, without Markdown. If the view has not "
-            "changed since your last round, describe a different detail.\n"
-            "3. Call a text-to-speech tool whose name ends with '_synthesize' "
-            "once with exactly that sentence, and wait for it to return before "
-            "starting the next round.\n"
-            "Start the next round immediately, whether or not the view changed. "
-            "Stop and reply with a one-line summary only when view_env_state "
-            "reports terminated or truncated as true, or a tool reports that "
-            "the session is closed. Do not call any other tool."
-        )
-        agent = Agent(
-            self.narrator_model,
-            name="scene_narrator",
-            system_prompt=prompt,
-            output_type=str,
-            toolsets=[
-                observe_toolset,
-                *self._narrator_toolsets(narrator_toolkit, speak),
-            ],
-            model_settings=_build_model_settings(
-                self.narrator_model,
-                min(self.max_tokens, 1024),
-                "none",
-                parallel_tool_calls=False,
-            ),
-            capabilities=[
-                SlidingWindowCompaction(
-                    max_messages=40, max_fraction=0.8, keep_messages=20
-                ),
-            ],
-        )
-        return _SceneNarrator(agent, recorder, self.dashboard_events)
-
-    def _narrator_toolsets(
-        self,
-        recorder: "_HarnessToolkit",
-        servers: tuple["McpServerSpec", ...],
-    ) -> list[Any]:
-        """Expose only ``synthesize`` from each server to the narrator."""
-        if not servers:
-            return []
-        MCPToolset = _mcp_toolset()
-
-        from rpent.utils.mcp_servers import request_headers
-
-        toolsets: list[Any] = []
-        for server in servers:
-            toolset = MCPToolset(
-                server.url,
-                id=f"{server.name}_narrator",
-                headers=request_headers(server) or None,
-                process_tool_call=recorder.external_tool_hook(server.name),
-            )
-            toolset = toolset.filtered(
-                lambda _ctx, tool_def: tool_def.name == "synthesize"
-            )
             toolsets.append(toolset.prefixed(server.name))
         return toolsets
 
@@ -796,40 +664,66 @@ class _HarnessToolkit(FunctionToolset):
         return result.to_text()
 
 
-class _SceneNarrator:
-    """Run one background narrator agent for the lifetime of a session."""
+class ApiSubAgent:
+    """Run a background agent with the tools selected for this instance."""
+
+    description: str
+
+    class ConfigurationError(ValueError):
+        """Required subagent capabilities are missing."""
 
     def __init__(
         self,
         agent: Agent,
         recorder: "_HarnessToolkit",
         dashboard_events: DashboardEventSink,
+        *,
+        prompt: str,
+        request_limit: int,
+        tools: Sequence[tuple["AbstractToolset", tuple[str, ...]]] = (),
     ) -> None:
         self._agent = agent
         self._recorder = recorder
         self._events = dashboard_events
         self._task: asyncio.Task[None] | None = None
-        self._prompt = "Start narrating the scene."
+        self._prompt = prompt
+        self._request_limit = request_limit
+        self._toolsets = [
+            toolset.filtered(lambda _ctx, tool_def, names=names: tool_def.name in names)
+            for toolset, names in tools
+        ]
+
+    def register(self) -> None:
+        """Expose this agent's background start tool to the main conversation."""
+        self._recorder.add_tool(
+            Tool(
+                self.start,
+                name=f"start_{self._agent.name}",
+                description=self.description,
+                takes_ctx=True,
+                sequential=True,
+            )
+        )
 
     async def start(self, ctx: RunContext) -> str:
-        """Start narration once; return immediately so the main agent continues."""
+        """Start the agent once; return immediately so the main agent continues."""
         capture = self._recorder.capture
         with capture.tool(ctx) if capture is not None else nullcontext():
-            self._recorder._record_call("start_scene_narrator", {}, ctx)
+            self._recorder._record_call(f"start_{self._agent.name}", {}, ctx)
             if capture is not None:
                 capture.start()
             if self._task is not None and not self._task.done():
-                text = "The scene narrator is already running."
+                text = f"{self._agent.name} is already running."
             else:
                 # An empty context keeps the main agent's current_tool_call
-                # ContextVar out of the narrator's tool executions.
+                # ContextVar out of the background agent's tool executions.
                 self._task = asyncio.create_task(
                     self._run(),
-                    name="scene-narrator",
+                    name=self._agent.name,
                     context=Context(),
                 )
-                text = "Scene narrator started; it runs until the episode ends."
-            self._recorder._record_result("start_scene_narrator", ctx, text)
+                text = f"{self._agent.name} started."
+            self._recorder._record_result(f"start_{self._agent.name}", ctx, text)
             if capture is not None:
                 capture.result(
                     Payload(
@@ -847,7 +741,7 @@ class _SceneNarrator:
             return text
 
     async def stop(self) -> None:
-        """Cancel and wait for the background narrator, if it is running."""
+        """Cancel and wait for the background agent, if it is running."""
         task = self._task
         if task is None or task.done():
             return
@@ -857,39 +751,43 @@ class _SceneNarrator:
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("scene narrator cleanup failed")
+            logger.exception("%s cleanup failed", self._agent.name)
 
     async def _run(self) -> None:
-        self._emit("[scene_narrator] started")
+        self._emit("started")
         try:
             await self._agent.run(
                 self._prompt,
-                usage_limits=UsageLimits(request_limit=_NARRATOR_MAX_REQUESTS),
+                usage_limits=UsageLimits(request_limit=self._request_limit),
+                toolsets=self._toolsets,
                 event_stream_handler=self._stream,
             )
         except asyncio.CancelledError:
             raise
         except UsageLimitExceeded:
             logger.info(
-                "scene narrator reached its %d-request budget",
-                _NARRATOR_MAX_REQUESTS,
+                "%s reached its %d-request budget",
+                self._agent.name,
+                self._request_limit,
             )
-            self._emit("[scene_narrator] request budget reached")
+            self._emit("request budget reached")
         except Exception:
-            logger.exception("scene narrator failed")
-            self._emit("[scene_narrator] failed; see logs")
+            logger.exception("%s failed", self._agent.name)
+            self._emit("failed; see logs")
         finally:
-            self._emit("[scene_narrator] stopped")
+            self._emit("stopped")
 
     async def _stream(self, _ctx: RunContext, stream: AsyncIterator[Any]) -> None:
         async for event in stream:
             if isinstance(event, PartEndEvent) and isinstance(event.part, TextPart):
                 text = event.part.content.strip()
                 if text:
-                    self._emit(f"[scene_narrator] {text}")
+                    self._emit(text)
 
     def _emit(self, text: str) -> None:
-        self._events.emit(TranscriptEvent({"type": "text", "text": text}))
+        self._events.emit(
+            TranscriptEvent({"type": "text", "text": f"[{self._agent.name}] {text}"})
+        )
 
 
 class _Session(AbstractCapability):
@@ -922,7 +820,7 @@ class _Session(AbstractCapability):
         self.run_done.set()
         self.cancellation: CancellationToken | None = None
         self.completions = 0
-        self.narrator: _SceneNarrator | None = None
+        self.subagent: ApiSubAgent | None = None
 
     async def wrap_run(
         self, ctx: RunContext, *, handler: WrapRunHandler
@@ -1136,8 +1034,8 @@ class _Session(AbstractCapability):
             # Stop new physical work before cancelling the SDK task. Toolkit
             # cancellation is cooperative, and must finish before solve returns.
             self.toolkit.stopping.set()
-            if self.narrator is not None:
-                await self.narrator.stop()
+            if self.subagent is not None:
+                await self.subagent.stop()
             if self.cancellation is not None:
                 self.cancellation.cancel()
             await cancel_and_wait(self.toolkit.cancel_active_and_wait)

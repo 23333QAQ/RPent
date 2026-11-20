@@ -245,7 +245,7 @@ def test_api_narrator_reads_and_speaks_in_the_background(tmp_path, monkeypatch):
                 )
             }
 
-        async def narrator_model(messages, info):
+        async def subagent_model(messages, info):
             returned = [
                 p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)
             ]
@@ -274,7 +274,7 @@ def test_api_narrator_reads_and_speaks_in_the_background(tmp_path, monkeypatch):
         )
         planner = ApiAgentLoop(
             model=FunctionModel(stream_function=main_model),
-            narrator_model=FunctionModel(stream_function=narrator_model),
+            subagent_model=FunctionModel(stream_function=subagent_model),
             dashboard_events=events,
             mcp_servers=load_site_mcp_servers(site),
         )
