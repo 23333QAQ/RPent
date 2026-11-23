@@ -156,6 +156,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         "overrides the backend default model.",
     )
     ap.add_argument(
+        "--subagent",
+        "--narrator",
+        dest="subagent",
+        choices=["narrator"],
+        default=None,
+        help="Enable a background subagent. Currently supported: narrator.",
+    )
+    ap.add_argument(
         "--base-url",
         default=None,
         help=(
@@ -362,6 +370,7 @@ def _start_continuation_session(
         robot_name=args.robot_name,
         base_url=args.base_url,
         model=args.model,
+        subagent=args.subagent,
         max_tokens=args.max_tokens,
         planner_timeout_s=args.planner_timeout_s,
         reasoning_effort=args.reasoning_effort,
@@ -538,6 +547,7 @@ def main() -> int:
         memory_dir=prompt_vars.get("memory_dir"),
         base_url=args.base_url,
         model=args.model,
+        subagent=args.subagent,
         max_tokens=args.max_tokens,
         planner_timeout_s=args.planner_timeout_s,
         reasoning_effort=args.reasoning_effort,

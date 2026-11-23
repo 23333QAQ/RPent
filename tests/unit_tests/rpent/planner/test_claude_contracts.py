@@ -368,12 +368,8 @@ def test_narrator_requires_observation_and_speech_tools(
         planner._build_options(claude_agent_sdk, toolkit=toolkit, max_turns=4)
 
 
-def test_build_planner_reads_subagent_model_from_the_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_build_planner_uses_the_main_model_for_the_narrator(tmp_path: Path) -> None:
     from rpent.planner.base import build_planner
-
-    monkeypatch.setenv("RPENT_CLAUDE_SUBAGENT_MODEL", "haiku")
 
     planner = build_planner(
         "claude_code",
@@ -382,6 +378,8 @@ def test_build_planner_reads_subagent_model_from_the_environment(
         robot_name="libero",
         memory_dir=tmp_path / "memory",
         dashboard_events=RecordingSink(),
+        model="haiku",
+        subagent="narrator",
     )
 
     assert planner._subagent_model == "haiku"

@@ -93,21 +93,18 @@ Relevant ``api`` planner knobs:
 - ``--no-images`` — never send image bytes; this is required for
   text-only models. The agent then reasons from textual state alone,
   so task performance may not be satisfactory.
-- Setting ``RPENT_API_SUBAGENT_MODEL`` to a provider-prefixed model id (for
-  example ``anthropic:claude-haiku-4-5``) registers a separate
-  ``scene_narrator`` agent. The main agent starts it with
+- Passing ``--subagent narrator`` (``--narrator`` is an alias) registers a
+  separate ``scene_narrator`` agent. The main agent starts it with
   ``start_scene_narrator`` when narration is requested; it repeatedly reads the
   latest observation, writes one short Chinese sentence, and calls the
   external MCP tool named ``<server>_synthesize``. It stops when the episode
   reports ``terminated`` or ``truncated`` or after 200 model requests, and the
   main run also stops it on exit. It has its own request budget and compaction
-  window, so it does not consume ``--max-turns``. The run therefore needs a
+  window, so it does not consume ``--max-turns``. The narrator uses the main
+  planner's model, API credentials, and base URL. The run therefore needs a
   server listing ``synthesize`` under ``planner_tools`` (see
   :ref:`external-mcp-servers`). The narrator always receives observation
-  images, including when the main planner uses ``--no-images``. If the
-  narrator uses a different provider, ``--base-url`` is not applied to it; set
-  ``RPENT_API_NARRATOR_BASE_URL`` or the provider's own endpoint variable
-  instead.
+  images, including when the main planner uses ``--no-images``.
 
 For ``--tui`` usage, see :ref:`Terminal interaction <quickstart-interactive>`.
 
@@ -144,7 +141,7 @@ Notes:
   Authentication normally uses ``ANTHROPIC_API_KEY``. See the
   `Claude Agent SDK docs
   <https://code.claude.com/docs/en/agent-sdk/overview>`_.
-- Setting ``RPENT_CLAUDE_SUBAGENT_MODEL`` (for example ``haiku``) registers a
+- Passing ``--subagent narrator`` (``--narrator`` is an alias) registers a
   ``scene_narrator`` subagent. Once the main agent launches it in the
   background, it repeatedly reads the latest observation, describes it in one
   sentence, and speaks it through an external MCP ``synthesize`` tool, so the
@@ -153,8 +150,9 @@ Notes:
   returns, whether or not the view changed, until the episode reports
   ``terminated`` or ``truncated`` or the subagent reaches 200 turns. The
   subagent can only read observations and call ``synthesize``, but it shares
-  the session's ``--claude-code-max-budget-usd``. It runs only when the main
-  agent launches it, so ask for narration in the task.
+  the session's model, endpoint, credentials, and
+  ``--claude-code-max-budget-usd``. It runs only when the main agent launches
+  it, so ask for narration in the task.
 
 Local Models with Claude Code
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

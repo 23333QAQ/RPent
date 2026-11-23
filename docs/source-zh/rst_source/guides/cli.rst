@@ -191,7 +191,7 @@ RPent CLI 保留原有 ``--cuda-device`` 作为本地服务的共享默认值；
 
 Codex 也可复用已有的 Codex 认证。模型选择、地址优先级和本地服务示例见 :doc:`configure_planner`。连接检查使用 ``rpent-check-llm``；记忆管理使用 ``rpent-memory``，操作方法见 :doc:`memory`。
 
-子 agent 的模型与主 planner 分开配置：``RPENT_CLAUDE_SUBAGENT_MODEL``、``RPENT_CODEX_SUBAGENT_MODEL`` 和 ``RPENT_API_SUBAGENT_MODEL``。``api`` 的值必须带提供商前缀；``RPENT_API_NARRATOR_BASE_URL`` 可单独覆盖 narrator 的地址。
+传入 ``--subagent narrator``（或它的 ``--narrator`` 别名）即可启用后台 scene narrator。三个 planner 都会让它复用主 planner 的模型、API 凭据和 endpoint。
 
 模型与资源路径由各环境读取，例如 LIBERO 的 ``PI05_CHECKPOINT_PATH``、``SAM3_CHECKPOINT_PATH``，RoboCasa365 的 ``ROBOCASA_ASSETS_PATH``，以及 RoboTwin 的 ``ROBOTWIN_ASSETS_PATH``、``LINGBOT_MODEL_PATH``。
 

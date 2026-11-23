@@ -35,7 +35,11 @@ class CodexSceneNarrator(CodexSubAgent):
     )
 
     def __init__(
-        self, toolkit: Toolkit, servers: tuple["McpServerSpec", ...], *, model: str
+        self,
+        toolkit: Toolkit,
+        servers: tuple["McpServerSpec", ...],
+        *,
+        model: str | None,
     ) -> None:
         from rpent.utils.mcp_servers import ALL_TOOLS
 
@@ -80,7 +84,9 @@ class CodexSceneNarrator(CodexSubAgent):
             "reports terminated or truncated as true, or a tool reports that "
             "the session is closed. Do not call any other tool."
         )
-        lines = [f"model = {_toml_value(self.model)}"]
+        lines = []
+        if self.model is not None:
+            lines.append(f"model = {_toml_value(self.model)}")
         if model_provider:
             lines.append(f"model_provider = {_toml_value(model_provider)}")
         lines.extend(

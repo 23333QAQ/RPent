@@ -121,8 +121,6 @@ def local_tools(monkeypatch):
     monkeypatch.setattr("rpent.tools.toolkit.substitute", lambda value: value)
     monkeypatch.setattr("rpent.planner.api_loop.substitute", lambda value: value)
     monkeypatch.setenv("PYDANTIC_AI_NO_BANNER", "1")
-    monkeypatch.delenv("RPENT_API_SUBAGENT_MODEL", raising=False)
-    monkeypatch.delenv("RPENT_API_NARRATOR_BASE_URL", raising=False)
 
 
 def tool(name, args=None, index=0):
@@ -2060,7 +2058,7 @@ def test_solve_rejects_narrator_without_a_synthesize_server() -> None:
         )
 
 
-def test_build_planner_reads_the_api_subagent_model(
+def test_build_planner_reuses_the_api_model_for_the_narrator(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from rpent.planner import base as planner_base
@@ -2072,8 +2070,6 @@ def test_build_planner_reads_the_api_subagent_model(
         return TestModel()
 
     monkeypatch.setattr(planner_base, "build_api_model", fake_build_api_model)
-    monkeypatch.setenv("RPENT_API_SUBAGENT_MODEL", "openai:gpt-5.5-mini")
-
     planner = planner_base.build_planner(
         "api",
         output_dir=tmp_path,
@@ -2082,16 +2078,15 @@ def test_build_planner_reads_the_api_subagent_model(
         dashboard_events=Events(),
         model="openai:gpt-5.5",
         base_url="https://proxy.example",
+        subagent="narrator",
     )
 
     assert planner.subagent_model is not None
-    assert calls == [
-        ("openai:gpt-5.5", "https://proxy.example"),
-        ("openai:gpt-5.5-mini", "https://proxy.example"),
-    ]
+    assert planner.subagent_name == "narrator"
+    assert calls == [("openai:gpt-5.5", "https://proxy.example")]
 
 
-def test_build_planner_does_not_apply_a_foreign_base_url_to_the_narrator(
+def test_build_planner_applies_the_main_base_url_to_the_narrator(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from rpent.planner import base as planner_base
@@ -2103,8 +2098,6 @@ def test_build_planner_does_not_apply_a_foreign_base_url_to_the_narrator(
         return TestModel()
 
     monkeypatch.setattr(planner_base, "build_api_model", fake_build_api_model)
-    monkeypatch.setenv("RPENT_API_SUBAGENT_MODEL", "anthropic:claude-haiku-4-5")
-
     planner_base.build_planner(
         "api",
         output_dir=tmp_path,
@@ -2113,6 +2106,7 @@ def test_build_planner_does_not_apply_a_foreign_base_url_to_the_narrator(
         dashboard_events=Events(),
         model="openai:gpt-5.5",
         base_url="https://proxy.example",
+        subagent="narrator",
     )
 
-    assert calls[-1] == ("anthropic:claude-haiku-4-5", None)
+    assert calls[-1] == ("openai:gpt-5.5", "https://proxy.example")

@@ -116,20 +116,22 @@ class ApiAgentLoop(Planner):
         timeout_s: float = 1200,
         interactive: bool = False,
         mcp_servers: tuple["McpServerSpec", ...] = (),
+        subagent_name: str | None = None,
         subagent_model: Model | None = None,
     ) -> None:
         """Initialize the API planner.
 
         Args:
-            subagent_model: Optional model for a background ``scene_narrator``
-                agent. ``None`` disables narration and leaves the main agent
-                unchanged.
+            subagent_name: Optional name of the background subagent to register.
+            subagent_model: Model used by the selected background subagent.
+                ``None`` disables subagent registration.
         """
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         if max_tokens < 1 or timeout_s <= 0:
             raise ValueError("max_tokens and timeout_s must be positive")
         self.model = model
+        self.subagent_name = subagent_name
         self.subagent_model = subagent_model
         self.dashboard_events = dashboard_events
         self.max_tokens = max_tokens
@@ -197,9 +199,9 @@ class ApiAgentLoop(Planner):
             )
             subagent = None
             if self.subagent_model is not None:
-                from rpent.planner.subagents.api_scene_narrator import ApiSceneNarrator
+                from rpent.planner.subagents import build_api_subagent
 
-                subagent = ApiSceneNarrator(self, adapter)
+                subagent = build_api_subagent(self.subagent_name, self, adapter)
                 subagent.register()
         except ApiSubAgent.ConfigurationError:
             raise

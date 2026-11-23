@@ -226,7 +226,9 @@ Set the credentials and endpoint for your chosen planner in the launch shell.
 
 Codex can also reuse existing Codex authentication. See :doc:`configure_planner` for model selection, endpoint precedence, and local server examples. Use ``rpent-check-llm`` for connectivity checks and ``rpent-memory`` for the operations in :doc:`memory`.
 
-Subagent models are configured separately from the main planner: ``RPENT_CLAUDE_SUBAGENT_MODEL``, ``RPENT_CODEX_SUBAGENT_MODEL``, and ``RPENT_API_SUBAGENT_MODEL``. The ``api`` value must include a provider prefix; ``RPENT_API_NARRATOR_BASE_URL`` optionally overrides the narrator endpoint.
+Pass ``--subagent narrator`` (or its ``--narrator`` alias) to enable the
+background scene narrator. It reuses the main planner's model, API credentials,
+and endpoint for all planner backends.
 
 Each environment reads its own resource variables, including LIBERO’s ``PI05_CHECKPOINT_PATH`` and ``SAM3_CHECKPOINT_PATH``, RoboCasa365’s ``ROBOCASA_ASSETS_PATH``, and RoboTwin’s ``ROBOTWIN_ASSETS_PATH`` and ``LINGBOT_MODEL_PATH``.
 

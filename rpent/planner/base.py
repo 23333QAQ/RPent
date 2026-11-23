@@ -50,20 +50,6 @@ def resolve_model(planner: str, model: str | None) -> str | None:
     return model or (os.environ.get("CODEX_MODEL") if planner == "codex" else None)
 
 
-def _same_provider(left: str | None, right: str | None) -> bool:
-    """Whether two provider-prefixed model ids use the same provider."""
-
-    def provider(model: str | None) -> str | None:
-        if not model or ":" not in model:
-            return None
-        name = model.split(":", 1)[0]
-        # ``openai`` and ``openai-chat`` share the OpenAI endpoint variables.
-        return "openai" if name in {"openai", "openai-chat"} else name
-
-    provider_name = provider(left)
-    return provider_name is not None and provider_name == provider(right)
-
-
 def add_mcp_prefix(name: str) -> str:
     """Return the namespaced MCP tool name for a bare tool name."""
     if name.startswith(MCP_TOOL_PREFIX):
@@ -266,6 +252,7 @@ def build_planner(
     robot_name: str,
     base_url: str | None = None,
     model: str | None = None,
+    subagent: str | None = None,
     memory_dir: str | Path | None = None,
     max_tokens: int = 8192,
     planner_timeout_s: int | None = None,
@@ -278,6 +265,9 @@ def build_planner(
 ) -> Planner:
     """Build a planner for the given backend, resolving credentials from env vars.
 
+    ``subagent`` selects an optional backend-specific subagent role. The
+    selected role reuses the planner's model and endpoint configuration.
+
     ``mcp_servers`` are external streamable-HTTP MCP servers available to this
     run (site-level plus robot-declared). Only specs with ``planner_tools`` set
     are attached: servers reserved for the robot's Env/Toolkit layer are
@@ -287,6 +277,10 @@ def build_planner(
     planner_servers = tuple(
         server for server in mcp_servers if server.planner_tools is not None
     )
+    if subagent not in (None, "narrator"):
+        raise ValueError(f"unknown subagent: {subagent}")
+    if subagent is not None and planner_type == "flash":
+        raise ValueError("--subagent is not supported with the flash planner")
     # Imports are deferred to avoid a circular import: api_loop / claude_code /
     # codex all import from this module (PlannerResult).
 
@@ -294,13 +288,6 @@ def build_planner(
         from rpent.planner.api_loop import ApiAgentLoop
 
         api_model = build_api_model(model, base_url)
-        subagent_model_id = os.environ.get("RPENT_API_SUBAGENT_MODEL") or None
-        subagent_model = None
-        if subagent_model_id:
-            narrator_base_url = os.environ.get("RPENT_API_NARRATOR_BASE_URL") or None
-            if narrator_base_url is None and _same_provider(model, subagent_model_id):
-                narrator_base_url = base_url
-            subagent_model = build_api_model(subagent_model_id, narrator_base_url)
         api_timeout_s = planner_timeout_s
         if api_timeout_s is None:
             api_timeout_s = int(os.environ.get("CELL_TIMEOUT_S", "1200"))
@@ -313,7 +300,8 @@ def build_planner(
             timeout_s=api_timeout_s,
             interactive=interactive,
             mcp_servers=planner_servers,
-            subagent_model=subagent_model,
+            subagent_name=subagent,
+            subagent_model=api_model if subagent is not None else None,
         )
     if planner_type == "claude_code":
         from rpent.planner.claude_code import ClaudeCodePlanner
@@ -335,7 +323,8 @@ def build_planner(
             dashboard_events=dashboard_events,
             reasoning_effort=reasoning_effort,
             mcp_servers=planner_servers,
-            subagent_model=os.environ.get("RPENT_CLAUDE_SUBAGENT_MODEL") or None,
+            subagent_name=subagent,
+            subagent_model=(model or "sonnet") if subagent is not None else None,
         )
     if planner_type == "codex":
         from rpent.planner.codex import CodexPlanner
@@ -358,7 +347,10 @@ def build_planner(
             dashboard_events=dashboard_events,
             reasoning_effort=reasoning_effort,
             mcp_servers=planner_servers,
-            subagent_model=os.environ.get("RPENT_CODEX_SUBAGENT_MODEL") or None,
+            subagent_name=subagent,
+            subagent_model=(model or os.environ.get("CODEX_MODEL"))
+            if subagent is not None
+            else None,
         )
     if planner_type == "flash":
         from rpent.planner.flash import FlashPlanner

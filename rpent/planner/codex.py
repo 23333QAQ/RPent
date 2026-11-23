@@ -111,14 +111,15 @@ class CodexPlanner(Planner):
         model: str | None = None,
         reasoning_effort: str = "none",
         mcp_servers: tuple["McpServerSpec", ...] = (),
+        subagent_name: str | None = None,
         subagent_model: str | None = None,
     ):
         """Initialize the Codex SDK backend.
 
         Args:
-            subagent_model: Model for the ``scene_narrator`` agent role, which
-                describes camera frames and speaks them through an external
-                MCP ``synthesize`` tool. ``None`` registers no role.
+            subagent_name: Optional subagent role to register.
+            subagent_model: Model for the selected subagent. ``None`` registers
+                no role.
         """
         self._output_dir = str(output_dir)
         self._repo_root = str(repo_root) if repo_root else str(get_repo_root())
@@ -131,6 +132,7 @@ class CodexPlanner(Planner):
         self._service_tier = os.environ.get("CODEX_SERVICE_TIER", None)
         self._dashboard_events = dashboard_events
         self._mcp_servers = mcp_servers
+        self._subagent_name = subagent_name
         self._subagent_model = subagent_model
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
@@ -174,10 +176,13 @@ class CodexPlanner(Planner):
         prompt = f"{system_prompt}\n\n{user_message}" if system_prompt else user_message
         subagent = None
         if self._subagent_model:
-            from rpent.planner.subagents.codex_scene_narrator import CodexSceneNarrator
+            from rpent.planner.subagents import build_codex_subagent
 
-            subagent = CodexSceneNarrator(
-                toolkit, self._mcp_servers, model=self._subagent_model
+            subagent = build_codex_subagent(
+                self._subagent_name,
+                toolkit=toolkit,
+                servers=self._mcp_servers,
+                model=self._subagent_model,
             )
 
         def session_config(mcp_url: str, output_path: Path) -> openai_codex.CodexConfig:

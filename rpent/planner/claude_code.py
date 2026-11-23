@@ -54,7 +54,6 @@ from rpent.planner.base import (
     display_tool_name,
     execute_tool,
 )
-from rpent.planner.subagents.claude_scene_narrator import build_scene_narrator_agent
 from rpent.planner.utils.http_mcp_server import mcp_result
 from rpent.session import MissingInfo, Payload
 from rpent.session.claude_capture import ClaudeTraceCapture
@@ -93,14 +92,15 @@ class ClaudeCodePlanner(Planner):
         output_path: str | Path | None = None,
         reasoning_effort: str = "none",
         mcp_servers: tuple["McpServerSpec", ...] = (),
+        subagent_name: str | None = None,
         subagent_model: str | None = None,
     ):
         """Initialize the Claude Agent SDK backend.
 
         Args:
-            subagent_model: Model for the ``scene_narrator`` subagent, which
-                describes camera frames and speaks them through an external
-                MCP ``synthesize`` tool. ``None`` registers no subagent.
+            subagent_name: Optional subagent role to register.
+            subagent_model: Model for the selected subagent. ``None`` registers
+                no subagent.
         """
         self._output_dir = str(output_dir)
         self._repo_root = str(repo_root) if repo_root else str(get_repo_root())
@@ -112,6 +112,7 @@ class ClaudeCodePlanner(Planner):
         self._output_path = Path(output_path) if output_path else None
         self._dashboard_events = dashboard_events
         self._mcp_servers = mcp_servers
+        self._subagent_name = subagent_name
         self._subagent_model = subagent_model
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
@@ -398,13 +399,16 @@ class ClaudeCodePlanner(Planner):
 
         agents = None
         if self._subagent_model:
-            narrator = build_scene_narrator_agent(
+            from rpent.planner.subagents import build_claude_subagent
+
+            name, definition = build_claude_subagent(
+                self._subagent_name,
                 sdk,
                 toolkit=toolkit,
                 servers=self._mcp_servers,
                 model=self._subagent_model,
             )
-            agents = {"scene_narrator": narrator}
+            agents = {name: definition}
             # Built-in tool the main agent uses to launch subagents.
             builtins.append("Agent")
             allowed.append("Agent")

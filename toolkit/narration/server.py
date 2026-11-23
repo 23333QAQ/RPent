@@ -100,9 +100,9 @@ def main() -> None:
     parser.add_argument(
         "--tts-backend",
         choices=["ovos", "edge"],
-        default="ovos",
-        help="ovos: local OpenVoiceOS MCP server (WAV); "
-        "edge: Microsoft Edge online voices (MP3, needs network)",
+        default="edge",
+        help="edge: Microsoft Edge online voices (MP3, needs network; default); "
+        "ovos: local OpenVoiceOS MCP server (WAV)",
     )
     parser.add_argument("--tts-url", default="http://127.0.0.1:9666/mcp/")
     parser.add_argument(

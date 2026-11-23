@@ -633,13 +633,10 @@ def test_build_config_keeps_existing_overrides_without_a_narrator(
     assert "features.multi_agent=true" not in config.config_overrides
 
 
-def test_build_planner_reads_codex_subagent_model_from_the_environment(
+def test_build_planner_uses_the_main_model_for_the_narrator(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rpent.planner.base import build_planner
-
-    monkeypatch.setenv("RPENT_CODEX_SUBAGENT_MODEL", "gpt-5.5")
 
     planner = build_planner(
         "codex",
@@ -648,6 +645,8 @@ def test_build_planner_reads_codex_subagent_model_from_the_environment(
         robot_name="libero",
         memory_dir=tmp_path / "memory",
         dashboard_events=RecordingSink(),
+        model="gpt-5.5",
+        subagent="narrator",
     )
 
     assert planner._subagent_model == "gpt-5.5"
