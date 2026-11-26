@@ -461,10 +461,21 @@ from the RPent checkout with the project environment active in both terminals.
    description to ``tts__synthesize``. The service writes MP3 files under
    ``logs/narration/`` on the service host without playing them.
 
-With ``api``, narration stops when the main agent's current run ends or is
-cancelled; ask for narration again in a later interactive turn to restart it.
+With LIBERO and ``--planner api``, the narrator samples the latest camera frame
+at startup and every five seconds, including during robot actions. In the task
+output directory, each narration run saves numbered images such as
+``narration/<run-id>/camera.jpg/00.jpg`` and records their capture and sampling
+times in ``narration/<run-id>/states.json``. If the camera view stays the same,
+images can repeat. Robots without a live narration feed use their latest saved
+observation.
 
-The example uses the default ``sync_with_robot: false``, so speech synthesis
-does not trigger another robot observation. Robot actions still wait for any
-in-flight synthesis call on the same toolkit. See :ref:`external-mcp-servers`
-for scheduling and timeout settings.
+The API narrator receives the newest sample with each speech tool result.
+If describing a frame and synthesizing its audio takes more than five seconds,
+the narrator skips intermediate samples for speech. Narration stops when the
+main agent's current run ends or is cancelled. To restart it, ask for narration
+again in a later turn.
+
+With the default ``sync_with_robot: false``, the API narrator can synthesize
+speech during robot actions. Claude Code and Codex use the toolkit's normal
+scheduling, so robot actions wait for synthesis to finish. See
+:ref:`external-mcp-servers` for scheduling and timeout settings.

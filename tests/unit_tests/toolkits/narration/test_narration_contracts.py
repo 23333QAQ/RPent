@@ -15,6 +15,7 @@ import io
 import json
 import sys
 import wave
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,8 +80,12 @@ def test_ovos_error_preserves_useful_detail():
 
 
 @pytest.mark.parametrize("failure", [None, "tts", "timeout", "blank", "oversized"])
-def test_mcp_synthesis_result_or_error(tmp_path, failure):
+def test_mcp_synthesis_result_or_error(tmp_path, monkeypatch, failure):
     calls = []
+    instant = datetime(2026, 11, 26, 7, 30, 15, 123456, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "toolkits.narration.server.datetime", SimpleNamespace(now=lambda: instant)
+    )
 
     async def synthesize(text):
         calls.append(text)
@@ -110,10 +115,12 @@ def test_mcp_synthesis_result_or_error(tmp_path, failure):
         ) as session:
             listing = await session.list_tools()
             assert [t.name for t in listing.tools] == ["synthesize"]
-            results = [await session.call_tool("synthesize", {"text": text})]
             if failure is None:
-                results.append(await session.call_tool("synthesize", {"text": text}))
-            return results
+                return await asyncio.gather(
+                    session.call_tool("synthesize", {"text": text}),
+                    session.call_tool("synthesize", {"text": text}),
+                )
+            return [await session.call_tool("synthesize", {"text": text})]
 
     results = asyncio.run(run())
     if failure:
@@ -128,6 +135,11 @@ def test_mcp_synthesis_result_or_error(tmp_path, failure):
         assert calls == [text, text]
         assert all(r["text"] == text for r in saved)
         assert len({r["audio_path"] for r in saved}) == 2
+        timestamp = instant.astimezone().strftime("%Y%m%d_%H%M%S_%f%z")
+        assert {Path(r["audio_path"]).stem for r in saved} == {
+            timestamp,
+            f"{timestamp}_1",
+        }
         for result in saved:
             assert Path(result["audio_path"]).read_bytes() == wav_bytes()
             assert "data" not in result
@@ -159,6 +171,10 @@ def test_server_saves_mp3_for_a_backend_that_reports_it(tmp_path):
     saved = result.structuredContent
     assert saved["mime_type"] == "audio/mpeg"
     assert saved["audio_path"].endswith(".mp3")
+    assert (
+        datetime.strptime(Path(saved["audio_path"]).stem, "%Y%m%d_%H%M%S_%f%z").tzinfo
+        is not None
+    )
     assert Path(saved["audio_path"]).read_bytes() == b"ID3fake-mp3"
 
 

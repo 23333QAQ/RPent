@@ -449,6 +449,7 @@ def test_env_state_reset_clears_memory_but_preserves_disk_artifacts(
 
     assert env_state.latest_step is None
     assert env_state.latest_record() is None
+    assert env_state.latest_saved_record() is None
     assert env_state.records() == []
     assert env_state.exists("run.txt", step=None)
     assert env_state.exists("step.bin", step=0)
@@ -485,6 +486,28 @@ def test_record_step_failure_removes_artifacts_written_by_discarded_step(
     assert isinstance(exc_info.value.__cause__, _StepFailure)
     assert env_state.records() == []
     assert not env_state.artifact_path("partial.bin", step=step).exists()
+
+
+def test_latest_saved_record_while_writing_or_rolling_back(tmp_path: Path) -> None:
+    state = EnvState(tmp_path)
+    with state.record_step(state={"view": "first"}):
+        assert state.latest_saved_record() is None
+        state.save("frame.bin", b"first")
+
+    with pytest.raises(RuntimeError, match="camera failed"):
+        with state.record_step(state={"view": "second"}, terminated=True):
+            state.save("frame.bin", b"second")
+            saved = state.latest_saved_record()
+            assert saved.step_idx == 0
+            assert not saved.terminated
+            assert state.load_bytes("frame.bin", step=saved.step_idx) == b"first"
+            saved.state["view"] = "edited"
+            raise _StepFailure("camera failed")
+
+    assert state.latest_saved_record().state == {"view": "first"}
+    with state.record_step(state={"view": "final"}, terminated=True):
+        state.save("frame.bin", b"final")
+    assert state.latest_saved_record() == state.get(1)
 
 
 @pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
@@ -551,6 +574,7 @@ def test_concurrent_saves_keep_artifacts_and_manifest_consistent(
         first = pool.submit(state.save, "first.json", {"value": 1})
         try:
             assert first_manifest.wait(3)
+            assert not state.latest_saved_record().artifacts
             second = pool.submit(save_second)
             assert second_started.wait(3)
             assert not second.done()
@@ -561,3 +585,4 @@ def test_concurrent_saves_keep_artifacts_and_manifest_consistent(
     manifest = json.loads((tmp_path / "states.json").read_text())
     assert set(manifest["steps"][0]["artifacts"]) == {"first.json", second_name}
     assert state.load(second_name) == {"value": 2}
+    assert state.latest_saved_record().artifacts == {"first.json", second_name}

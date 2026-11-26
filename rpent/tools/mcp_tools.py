@@ -241,6 +241,7 @@ def _registered_tool(
         # serialization explicitly through sync_with_robot.
         readonly=not sync_with_robot,
         preserve_result=sync_with_robot,
+        background_mcp=not sync_with_robot,
     )
 
 

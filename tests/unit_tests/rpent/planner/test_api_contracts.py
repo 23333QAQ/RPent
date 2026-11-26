@@ -1729,6 +1729,227 @@ def test_background_narrator_isolated_idempotent_and_cancelled(tmp_path):
     assert calls[0].feedback.data["return_value"] == starts[0]
 
 
+@pytest.mark.parametrize("busy_with", ["model", "speech"])
+def test_narrator_samples_saved_images_while_busy_and_stops(
+    tmp_path, monkeypatch, busy_with
+):
+    from rpent.planner.subagents import scene_narrator
+
+    monkeypatch.setattr(scene_narrator, "_NARRATOR_READ_INTERVAL_S", 0.02)
+    toolkit = capturing_toolkit(tmp_path)
+    with toolkit.state.record_step(state={}):
+        toolkit.state.save("camera.png", np.zeros((8, 8, 3), dtype=np.uint8))
+    busy = threading.Event()
+    sampled = threading.Event()
+    reads = []
+    load_bytes = toolkit.state.load_bytes
+
+    def read(name, *, step=-1):
+        data = load_bytes(name, step=step)
+        if busy.is_set():
+            reads.append((step, data))
+            if len(reads) >= 3:
+                sampled.set()
+        return data
+
+    def synthesize():
+        busy.set()
+        while True:
+            toolkit.raise_if_cancelled()
+            time.sleep(0.005)
+
+    monkeypatch.setattr(toolkit.state, "load_bytes", read)
+    toolkit.register("view_env_state", lambda: ToolResult())
+    toolkit.register("tts__synthesize", synthesize)
+    requests = 0
+
+    async def child(messages, info):
+        if busy_with == "speech":
+            yield tool("tts__synthesize")
+        else:
+            busy.set()
+            yield "Inspecting."
+            await asyncio.Event().wait()
+
+    async def main(messages, info):
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            yield tool("start_scene_narrator")
+        else:
+            assert await asyncio.to_thread(sampled.wait, 2)
+            yield "Done."
+
+    result, _, _ = solve(
+        tmp_path,
+        FunctionModel(stream_function=main),
+        toolkit,
+        subagent_name="narrator",
+        subagent_model=FunctionModel(stream_function=child),
+        timeout_s=3,
+    )
+    assert result.error is None
+    assert len(reads) >= 3
+    assert all(step == 0 and data == reads[0][1] for step, data in reads)
+    completed_reads = len(reads)
+    time.sleep(0.06)
+    assert len(reads) == completed_reads
+
+
+def test_narrator_reads_completed_image_during_an_exclusive_action(
+    tmp_path, monkeypatch
+):
+    toolkit = capturing_toolkit(tmp_path)
+    with toolkit.state.record_step(state={"position": 0}):
+        toolkit.state.save("camera.png", np.zeros((8, 8, 3), dtype=np.uint8))
+    moving = threading.Event()
+    observed = threading.Event()
+    requests = 0
+    child_requests = 0
+
+    def move():
+        with toolkit.state.record_step(state={"position": 1}):
+            toolkit.state.save("camera.png", np.ones((8, 8, 3), dtype=np.uint8))
+            moving.set()
+            assert observed.wait(2)
+        return ToolResult()
+
+    def native_observation():
+        pytest.fail("The narrator should read its saved sample during motion.")
+
+    toolkit.register("move", move, declaration=declare_tool(name="move")(move))
+    toolkit.register("view_env_state", native_observation)
+    toolkit.register("tts__synthesize", lambda: ToolResult())
+    monkeypatch.setattr(toolkit, "get_env_state", lambda **kwargs: ToolResult())
+
+    async def child(messages, info):
+        nonlocal child_requests
+        child_requests += 1
+        if child_requests == 1:
+            assert await asyncio.to_thread(moving.wait, 2)
+            yield tool("view_env_state")
+        else:
+            returned = [
+                part
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolReturnPart)
+            ]
+            assert json.loads(returned[-1].content)["step"] == 0
+            observed.set()
+            yield "Observed the saved frame."
+
+    async def main(messages, info):
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            yield tool("start_scene_narrator")
+        elif requests == 2:
+            yield tool("move")
+        else:
+            yield "Done."
+
+    result, _, _ = solve(
+        tmp_path,
+        FunctionModel(stream_function=main),
+        toolkit,
+        subagent_name="narrator",
+        subagent_model=FunctionModel(stream_function=child),
+        timeout_s=4,
+    )
+    assert result.error is None
+    assert observed.is_set()
+
+
+def test_narrator_saves_live_frames_and_uses_latest_after_speech(tmp_path, monkeypatch):
+    from rpent.planner.subagents import scene_narrator
+
+    monkeypatch.setattr(scene_narrator, "_NARRATOR_READ_INTERVAL_S", 0.02)
+    toolkit = capturing_toolkit(tmp_path)
+    speech_started = threading.Event()
+    sampled = threading.Event()
+    release_speech = threading.Event()
+    described = asyncio.Event()
+    frames = []
+    requests = 0
+    child_requests = 0
+
+    def narration_frame():
+        frames.append(len(frames))
+        if len(frames) >= 5:
+            sampled.set()
+        return {
+            "sequence": len(frames),
+            "captured_at": time.time(),
+            "terminated": False,
+            "truncated": False,
+            "rgb": np.full((8, 8, 3), len(frames), dtype=np.uint8),
+        }
+
+    def synthesize(text: str):
+        speech_started.set()
+        assert release_speech.wait(2)
+        return ToolResult(data={"text": text})
+
+    monkeypatch.setattr(toolkit, "narration_frame", narration_frame)
+    toolkit.register("view_env_state", lambda: ToolResult())
+    toolkit.register("tts__synthesize", synthesize)
+
+    async def child(messages, info):
+        nonlocal child_requests
+        child_requests += 1
+        if child_requests == 1:
+            yield tool("view_env_state")
+        elif child_requests == 2:
+            yield tool("tts__synthesize", {"text": "机械臂正在移动"})
+        else:
+            content = [
+                item
+                for message in messages
+                for part in message.parts
+                if isinstance(part, UserPromptPart) and isinstance(part.content, list)
+                for item in part.content
+            ]
+            observations = [
+                json.loads(item.removeprefix("Latest observation:\n"))
+                for item in content
+                if isinstance(item, str) and item.startswith("Latest observation:\n")
+            ]
+            assert observations[-1]["step"] >= 3
+            assert (
+                len([item for item in content if isinstance(item, BinaryContent)]) == 1
+            )
+            described.set()
+            yield "Described the newest image."
+
+    async def main(messages, info):
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            yield tool("start_scene_narrator")
+        else:
+            try:
+                assert await asyncio.to_thread(speech_started.wait, 2)
+                assert await asyncio.to_thread(sampled.wait, 2)
+            finally:
+                release_speech.set()
+            await asyncio.wait_for(described.wait(), 2)
+            yield "Done."
+
+    result, _, _ = solve(
+        tmp_path,
+        FunctionModel(stream_function=main),
+        toolkit,
+        subagent_name="narrator",
+        subagent_model=FunctionModel(stream_function=child),
+        timeout_s=4,
+    )
+    assert result.error is None
+    assert child_requests == 3
+    assert len(list((tmp_path / "narration").glob("*/camera.jpg/*.jpg"))) >= 4
+    assert toolkit.state.latest_saved_record() is None
+
+
 def test_narrator_requires_registered_synthesis_tool(tmp_path):
     with pytest.raises(ValueError, match="synthesize"):
         solve(tmp_path, TestModel(), subagent_name="narrator")

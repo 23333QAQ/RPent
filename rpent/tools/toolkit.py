@@ -21,12 +21,13 @@ through :meth:`Toolkit.list_tools` and dispatch through :meth:`Toolkit.execute_t
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
 import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
 class _ToolOperation:
     readonly: bool
     _condition: threading.Condition
+    independent: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event)
     _cancel_callbacks: list[Callable[[], None]] = field(default_factory=list)
     done: bool = False
@@ -86,11 +88,11 @@ def current_tool_operation() -> _ToolOperation | None:
 
 
 class _Scheduler:
-    """Share readonly calls; run queued exclusive calls in arrival order.
+    """Share readonly calls and run queued exclusive calls in arrival order.
 
     A plain RWLock only provides mutual exclusion. Tool calls also need ordered
     writers, cancellation of queued and active calls, and pause/close with drain.
-    One condition keeps admission and these lifecycle transitions synchronized.
+    Independent MCP calls skip the robot queue but participate in the same drain.
     """
 
     def __init__(self) -> None:
@@ -100,13 +102,16 @@ class _Scheduler:
         self.paused = False
         self.closed = False
 
-    def acquire(self, *, readonly: bool) -> _ToolOperation:
+    def acquire(self, *, readonly: bool, independent: bool = False) -> _ToolOperation:
         with self.condition:
             if self.closed:
                 raise ToolCancelled("Toolkit is closed.")
             if self.paused:
                 raise ToolCancelled("Tool calls are paused.")
-            call = _ToolOperation(readonly=readonly, _condition=self.condition)
+            call = _ToolOperation(readonly, self.condition, independent=independent)
+            if independent:
+                self.active.add(call)
+                return call
             self.pending.append(call)
             self.condition.notify_all()
             try:
@@ -120,7 +125,11 @@ class _Scheduler:
                         readonly
                         and exclusive is None
                         and all(item.readonly for item in self.active)
-                    ) or (not readonly and not self.active and call is exclusive):
+                    ) or (
+                        not readonly
+                        and call is exclusive
+                        and all(item.independent for item in self.active)
+                    ):
                         self.pending.remove(call)
                         self.active.add(call)
                         return call
@@ -137,12 +146,17 @@ class _Scheduler:
             call.done = True
             self.condition.notify_all()
 
-    def cancel(self, *, close: bool = False) -> list[_ToolOperation]:
+    def cancel(
+        self, *, close: bool = False, operation: _ToolOperation | None = None
+    ) -> list[_ToolOperation]:
         callbacks: list[Callable[[], None]] = []
         with self.condition:
-            self.paused = True
-            self.closed |= close
-            calls = [*self.pending, *self.active]
+            if operation is None:
+                self.paused = True
+                self.closed |= close
+                calls = [*self.pending, *self.active]
+            else:
+                calls = [operation]
             for call in calls:
                 call.cancel_event.set()
                 callbacks.extend(call._cancel_callbacks)
@@ -305,11 +319,77 @@ class Toolkit:
             for tool in self._tools.values()
         )
 
+    def narration_frame(self) -> dict[str, Any] | None:
+        """Return the latest independently published camera frame, if supported.
+
+        A robot adapter supplies ``rgb``, ``sequence``, ``captured_at``,
+        ``terminated``, and ``truncated`` from one published observation.
+        """
+        return None
+
+    def supports_background_mcp_tool(self, name: str) -> bool:
+        """Return whether this registered MCP tool can run alongside robot actions."""
+        tool = self._tools.get(name)
+        return tool is not None and tool.background_mcp
+
     def execute_tool(self, name: str, input_dict: dict[str, Any]) -> ToolResult:
         """Validate one call, execute it, and capture state for advancing tools."""
+        call = self._prepare_call(name, input_dict)
+        if isinstance(call, ToolResult):
+            return call
+        return self._run_tool(input_dict, *call)
+
+    async def execute_background_mcp_tool(
+        self, name: str, input_dict: dict[str, Any]
+    ) -> ToolResult:
+        """Run a registered, unsynchronized MCP tool alongside robot actions.
+
+        Cancelling the awaiting task interrupts only its MCP request. Toolkit
+        shutdown and interruption also cancel and drain background requests.
+
+        Args:
+            name: Registered tool name, such as ``tts__synthesize``.
+            input_dict: Tool arguments validated against its registered schema.
+
+        Returns:
+            The tool result, including validation or cancellation errors.
+        """
+        call = self._prepare_call(name, input_dict, independent=True)
+        if isinstance(call, ToolResult):
+            return call
+        tool, arguments, operation = call
+        try:
+            worker = asyncio.get_running_loop().run_in_executor(
+                None,
+                copy_context().run,
+                self._run_tool,
+                input_dict,
+                tool,
+                arguments,
+                operation,
+            )
+        except BaseException:
+            self._scheduler.release(operation)
+            raise
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            self._scheduler.cancel(operation=operation)
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+            raise
+
+    def _prepare_call(
+        self, name: str, input_dict: dict[str, Any], *, independent: bool = False
+    ) -> ToolResult | tuple[Tool, dict[str, Any], _ToolOperation]:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(data={"error": f"unknown tool: {name}"})
+        if independent and not tool.background_mcp:
+            return ToolResult(data={"error": f"not a background MCP tool: {name}"})
         try:
             parameters = tool.args_schema.model_validate(input_dict, strict=True)
         except ValidationError as exc:
@@ -332,12 +412,24 @@ class Toolkit:
         kwargs.update(parameters.model_extra or {})
 
         try:
-            operation = self._scheduler.acquire(readonly=tool.readonly)
+            operation = self._scheduler.acquire(
+                readonly=tool.readonly, independent=independent
+            )
         except ToolCancelled as exc:
             return ToolResult(
                 data={"error": str(exc), "code": "tool_cancelled", "interrupted": True}
             )
 
+        return tool, kwargs, operation
+
+    def _run_tool(
+        self,
+        input_dict: dict[str, Any],
+        tool: Tool,
+        kwargs: dict[str, Any],
+        operation: _ToolOperation,
+    ) -> ToolResult:
+        name = tool.name
         try:
             started = time.perf_counter()
             capture = current_tool_call.get()
@@ -467,8 +559,13 @@ class Toolkit:
 
     def raise_if_cancelled(self) -> None:
         """Raise at an environment-defined safe cancellation boundary."""
+        operation = current_tool_operation()
         with self._scheduler.condition:
-            if any(call.cancel_event.is_set() for call in self._scheduler.active):
+            if any(
+                call.cancel_event.is_set()
+                and (not call.independent or call is operation)
+                for call in self._scheduler.active
+            ):
                 raise ToolCancelled("tool operation interrupted")
 
     def close(self) -> None:

@@ -16,8 +16,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
+from copy import deepcopy
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from rpent.planner.api_loop import ApiAgentLoop, ApiSubAgent, _HarnessToolkit
@@ -28,6 +33,7 @@ NARRATOR_NAME = "scene_narrator"
 
 #: API request budget, independent of the main conversation's ``max_turns``.
 _NARRATOR_MAX_REQUESTS = 200
+_NARRATOR_READ_INTERVAL_S = 5.0
 
 _DESCRIPTION = (
     "Keeps narrating the robot's camera view aloud until the episode ends. "
@@ -47,8 +53,9 @@ _PROMPT = (
     "2. Describe what you see in one Chinese sentence of at most 20 characters, "
     "without Markdown. If the view is unchanged, describe a different detail.\n"
     "3. Call a text-to-speech tool whose name ends with '__synthesize' "
-    "once with exactly that sentence. Wait for it to return, then immediately "
-    "read the next observation."
+    "once with exactly that sentence. Wait for it to return. If its result "
+    "includes an observation, describe that image next; otherwise read the "
+    "next observation."
 )
 
 
@@ -86,7 +93,14 @@ def select_narrator_tools(
 
 def build_api_narrator(planner: ApiAgentLoop, recorder: _HarnessToolkit) -> ApiSubAgent:
     """Build an API narrator with independent history and a fresh toolset per run."""
-    from pydantic_ai import AbstractToolset, Agent, RunContext
+    from pydantic_ai import (
+        AbstractToolset,
+        Agent,
+        BinaryContent,
+        ModelRetry,
+        RunContext,
+        ToolReturn,
+    )
     from pydantic_ai.capabilities import Thinking
     from pydantic_ai_harness.compaction import SlidingWindowCompaction
 
@@ -95,6 +109,183 @@ def build_api_narrator(planner: ApiAgentLoop, recorder: _HarnessToolkit) -> ApiS
         _build_model_settings,
         _HarnessToolkit,
     )
+    from rpent.planner.base import _wait_for_cleanup
+    from rpent.session import EnvState
+    from rpent.tools import ToolResult
+    from rpent.utils.logging import get_logger
+
+    latest: ToolReturn | None = None
+    delivered: ToolReturn | None = None
+    narration_store: EnvState | None = None
+    changed = asyncio.Event()
+    logger = get_logger(__name__)
+
+    class NarrationToolkit(_HarnessToolkit):
+        async def execute(
+            self, name: str, arguments: dict[str, Any], ctx: RunContext
+        ) -> ToolResult:
+            if not self.toolkit.supports_background_mcp_tool(name):
+                return await super().execute(name, arguments, ctx)
+            error = next(self.validators[name].iter_errors(arguments), None)
+            if error is not None:
+                raise ModelRetry(f"Invalid arguments for {name}: {error.message}")
+            self._record_call(name, arguments, ctx)
+            result = await self.toolkit.execute_background_mcp_tool(name, arguments)
+            self._record_result(name, ctx, result.to_text())
+            if self.stopping.is_set():
+                ctx.cancel()
+                raise asyncio.CancelledError
+            return result
+
+        async def call(
+            self, name: str, ctx: RunContext, /, **arguments: Any
+        ) -> ToolReturn:
+            nonlocal delivered
+            if name.partition("__")[2] == "synthesize":
+                result = await super().call(name, ctx, **arguments)
+                if latest is not None:
+                    while latest is delivered:
+                        changed.clear()
+                        await changed.wait()
+                    delivered = latest
+                    if delivered is not None:
+                        result.content = [
+                            "Latest observation:\n"
+                            + ToolResult(data=delivered.return_value).to_text(),
+                            *(delivered.content or []),
+                        ]
+                return result
+            if (
+                name != "view_env_state"
+                or latest is None
+                or arguments.get("step", -1)
+                not in (-1, None, latest.return_value["step"])
+            ):
+                return await super().call(name, ctx, **arguments)
+            error = next(self.validators[name].iter_errors(arguments), None)
+            if error is not None:
+                raise ModelRetry(f"Invalid arguments for {name}: {error.message}")
+            self._record_call(name, arguments, ctx)
+            delivered = latest
+            result = deepcopy(latest)
+            result.return_value = ToolResult(data=result.return_value).to_text()
+            self._record_result(name, ctx, result.return_value)
+            return result
+
+        def _read_image(self, name: str, step: int) -> ToolReturn:
+            sampled = latest
+            if sampled is not None and step in (-1, sampled.return_value["step"]):
+                step = sampled.return_value["step"]
+                if name == sampled.return_value.get("image"):
+                    return ToolReturn(
+                        return_value={"artifact": name, "step": step},
+                        content=list(sampled.content or []),
+                    )
+            if step == -1:
+                try:
+                    record = self.toolkit.state.latest_saved_record()
+                except RuntimeError as exc:
+                    return ToolReturn(return_value={"error": str(exc)})
+                if record is None:
+                    return ToolReturn(
+                        return_value={"error": "No completed observation is available."}
+                    )
+                step = record.step_idx
+            return super()._read_image(name, step)
+
+    def read_saved_observation() -> ToolReturn | None:
+        nonlocal narration_store
+        try:
+            state = recorder.toolkit.state
+        except RuntimeError:
+            return None
+        frame = recorder.toolkit.narration_frame()
+        if frame is not None:
+            if narration_store is None:
+                narration_store = EnvState(state.output_dir / "narration" / uuid4().hex)
+            metadata = {
+                "source_sequence": frame["sequence"],
+                "captured_at": frame["captured_at"],
+                "sampled_at": time.time(),
+            }
+            with narration_store.record_step(
+                state=metadata,
+                terminated=frame["terminated"],
+                truncated=frame["truncated"],
+            ) as step:
+                if narration_store.save("camera.jpg", frame["rgb"], step=step) is None:
+                    raise OSError("Failed to save the narration camera image")
+            return ToolReturn(
+                return_value={
+                    **metadata,
+                    "step": step,
+                    "source": "narration",
+                    "terminated": frame["terminated"],
+                    "truncated": frame["truncated"],
+                    "image": "camera.jpg",
+                },
+                content=[
+                    BinaryContent(
+                        data=narration_store.load_bytes("camera.jpg", step=step),
+                        media_type="image/jpeg",
+                    )
+                ],
+            )
+        record = state.latest_saved_record()
+        if record is None:
+            return None
+        metadata = {
+            "step": record.step_idx,
+            "terminated": record.terminated,
+            "truncated": record.truncated,
+            "state": record.state,
+            "artifacts": sorted(record.artifacts),
+            "task_language": record.extras.get("task_language"),
+        }
+        for name in sorted(record.artifacts):
+            if Path(name).suffix.lower() in {".png", ".jpg", ".jpeg"}:
+                try:
+                    data = state.load_bytes(name, step=record.step_idx)
+                except FileNotFoundError:
+                    continue
+                metadata["image"] = name
+                return ToolReturn(
+                    return_value=metadata,
+                    content=[
+                        BinaryContent(
+                            data=data,
+                            media_type=(
+                                "image/png"
+                                if Path(name).suffix.lower() == ".png"
+                                else "image/jpeg"
+                            ),
+                        )
+                    ],
+                )
+        if record.terminated or record.truncated:
+            return ToolReturn(return_value=metadata)
+        return None
+
+    async def read_observation() -> None:
+        nonlocal latest
+        worker = asyncio.create_task(asyncio.to_thread(read_saved_observation))
+        try:
+            latest = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await _wait_for_cleanup(worker)
+            raise
+        except Exception:
+            latest = None
+            logger.exception("Failed to sample the narration image")
+        changed.set()
+
+    async def sample_observations() -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _NARRATOR_READ_INTERVAL_S
+        while True:
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+            deadline = loop.time() + _NARRATOR_READ_INTERVAL_S
+            await read_observation()
 
     # Define backend subclasses here so importing another role factory does not
     # load this backend's SDK or its planner adapter.
@@ -107,11 +298,34 @@ def build_api_narrator(planner: ApiAgentLoop, recorder: _HarnessToolkit) -> ApiS
             "spoken narration; do not wait for it."
         )
 
+        async def _run(self) -> None:
+            nonlocal latest, delivered, narration_store
+            latest = None
+            delivered = None
+            narration_store = None
+            changed.clear()
+            await read_observation()
+            sampling = asyncio.create_task(sample_observations())
+            try:
+                await super()._run()
+            finally:
+                sampling.cancel()
+                try:
+                    await sampling
+                except asyncio.CancelledError:
+                    pass
+
     allowed = select_narrator_tools(recorder.toolkit, include_read_image=True)
     agent = Agent(
         planner.subagent_model,
         name=NARRATOR_NAME,
-        system_prompt=_PROMPT,
+        system_prompt=(
+            _PROMPT + "\nCamera images are sampled and saved every five seconds in "
+            "the background. view_env_state returns the latest sample. Use its "
+            "embedded image directly. After synthesis, the tool supplies the "
+            "next available sample; describe it immediately. Source frames can "
+            "repeat while the environment is stationary."
+        ),
         output_type=str,
         model_settings=_build_model_settings(
             planner.subagent_model,
@@ -120,16 +334,14 @@ def build_api_narrator(planner: ApiAgentLoop, recorder: _HarnessToolkit) -> ApiS
             parallel_tool_calls=False,
         ),
         capabilities=[
-            SlidingWindowCompaction(
-                max_messages=40, max_fraction=0.8, keep_messages=20
-            ),
+            SlidingWindowCompaction(max_messages=3, keep_messages=2, receipts=False),
             Thinking(False),
         ],
     )
 
     @agent.toolset(per_run_step=False)
     def narration_tools(_ctx: RunContext) -> AbstractToolset:
-        adapter = _HarnessToolkit(
+        adapter = NarrationToolkit(
             recorder.toolkit,
             dashboard_events=planner.dashboard_events,
             no_images=False,

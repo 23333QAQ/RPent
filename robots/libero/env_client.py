@@ -96,6 +96,10 @@ class LiberoEnvClient(BaseEnvClient):
     def raw_obs(self) -> dict:
         return self._client.call("env.raw_obs", timeout_s=self._TIMEOUT_S["default"])
 
+    def narration_frame(self) -> dict[str, Any] | None:
+        """Read the latest rendered RGB, capture time, sequence and episode flags."""
+        return self._client.call("env.narration_frame", timeout_s=5.0)
+
     def render_camera(
         self,
         camera_name: str = "agentview",

@@ -327,6 +327,10 @@ def test_sync_with_robot_captures_observation_and_preserves_remote_result(
         )
         registered = toolkit.add_mcp_servers((spec,))
         assert registered == ("dock__set_dock", "dock__fail_dock")
+        assert not toolkit.supports_background_mcp_tool("dock__set_dock")
+        assert asyncio.run(
+            toolkit.execute_background_mcp_tool("dock__set_dock", {"enabled": True})
+        ).is_error
 
         ok = toolkit.execute_tool("dock__set_dock", {"enabled": True})
         assert not ok.is_error
@@ -560,6 +564,80 @@ def test_external_mcp_tools_work_across_all_online_planner_adapters(
             assert f"mcp_rpent_{tool_name}" in settings["tools"]["core"]
         finally:
             http_server.stop()
+
+
+@pytest.mark.parametrize("speech_first", [False, True])
+def test_background_speech_overlaps_robot_and_drains_on_cancellation(
+    tmp_path: Path, speech_first: bool
+) -> None:
+    speaking = threading.Event()
+    moving = threading.Event()
+    finish_move = threading.Event()
+    finish_speech = threading.Event()
+    toolkit = _RecordingToolkit(tmp_path)
+
+    @tool
+    def move() -> ToolResult:
+        """Wait for the test to finish the robot action."""
+        moving.set()
+        assert finish_move.wait(5)
+        toolkit.raise_if_cancelled()
+        return ToolResult()
+
+    toolkit.add_tool(move)
+    speech = types.Tool(
+        name="synthesize",
+        inputSchema={"type": "object", "properties": {"text": {"type": "string"}}},
+    )
+
+    async def speak(name, arguments, headers):
+        speaking.set()
+        await asyncio.to_thread(finish_speech.wait, 5)
+        return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+
+    async def run() -> None:
+        def start_speech():
+            return asyncio.create_task(
+                toolkit.execute_background_mcp_tool(
+                    "tts__synthesize", {"text": "Hello"}
+                )
+            )
+
+        if speech_first:
+            saying = start_speech()
+            assert await asyncio.to_thread(speaking.wait, 3)
+        motion = asyncio.create_task(
+            asyncio.to_thread(toolkit.execute_tool, "move", {})
+        )
+        assert await asyncio.to_thread(moving.wait, 3)
+        if not speech_first:
+            saying = start_speech()
+            assert await asyncio.to_thread(speaking.wait, 3)
+            # Cancelling only the narrator must leave the moving robot alone.
+            saying.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await saying
+        finish_move.set()
+        assert not (await motion).is_error
+        if speech_first:
+            toolkit.close()
+            assert (await saying).data["code"] == "tool_cancelled"
+            assert (
+                await toolkit.execute_background_mcp_tool(
+                    "tts__synthesize", {"text": "Again"}
+                )
+            ).data["code"] == "tool_cancelled"
+        else:
+            assert not toolkit.execute_tool("robot_step", {"label": "next"}).is_error
+
+    with _running_mcp_server([speech], speak) as (url, _):
+        try:
+            toolkit.add_mcp_servers((McpServerSpec(name="tts", url=url),))
+            asyncio.run(run())
+        finally:
+            finish_move.set()
+            finish_speech.set()
+            toolkit.close()
 
 
 def test_cancel_active_and_wait_interrupts_inflight_mcp_call_promptly(

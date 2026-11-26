@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -104,11 +106,47 @@ def build_env_cfg(
     return cfg
 
 
+class _NarrationFrames:
+    """Retain one rendered observation while the environment executes a chunk."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sequence = 0
+        self._frame: dict[str, Any] | None = None
+
+    def publish(self, obs, terminated=False, truncated=False, *, reset=False) -> None:
+        if obs is None:
+            return
+        with self._lock:
+            previous = None if reset else self._frame
+            self._sequence += 1
+            self._frame = {
+                "sequence": self._sequence,
+                "captured_at": time.time(),
+                # RLinf stacks a fresh main_images tensor for each rendered step.
+                # Keep it alive for the reader without copying every control frame.
+                "rgb": obs["main_images"][0],
+                "terminated": bool(terminated)
+                or bool(previous and previous["terminated"]),
+                "truncated": bool(truncated)
+                or bool(previous and previous["truncated"]),
+            }
+
+    def read(self) -> dict[str, Any] | None:
+        with self._lock:
+            frame = self._frame
+        if frame is None:
+            return None
+        return {**frame, "rgb": np.array(to_numpy_tree(frame["rgb"]), copy=True)}
+
+
 def make_env(
     task_id: int,
     seed: int,
     suite_name: str = "libero_spatial",
     max_episode_steps: int = 10000,
+    *,
+    narration_frames: _NarrationFrames | None = None,
 ) -> LiberoEnv:
     """Build a single-env LiberoEnv pinned to ``task_id`` / ``seed``."""
     from rlinf.envs.sim.libero.libero_env import LiberoEnv
@@ -130,7 +168,18 @@ def make_env(
         seed=seed,
         max_episode_steps=max_episode_steps,
     )
-    return LiberoEnv(
+    env_type = LiberoEnv
+    if narration_frames is not None:
+
+        class NarratedLiberoEnv(LiberoEnv):
+            def step(self, *args, **kwargs):
+                result = super().step(*args, **kwargs)
+                obs, _, term, trunc, _ = result
+                narration_frames.publish(obs, term, trunc)
+                return result
+
+        env_type = NarratedLiberoEnv
+    return env_type(
         cfg=cfg, num_envs=1, seed_offset=0, total_num_processes=1, worker_info=None
     )
 
@@ -149,8 +198,15 @@ class LiberoEnvFacade(BaseEnvFacade):
     trip.
     """
 
-    def __init__(self, env: LiberoEnv, *, meta: dict):
+    def __init__(
+        self,
+        env: LiberoEnv,
+        *,
+        meta: dict,
+        narration_frames: _NarrationFrames | None = None,
+    ):
         self._env = env
+        self._narration_frames = narration_frames
         self._env_idx = 0
         self._closed = False
         # Identifies what task/seed this server was launched with — the
@@ -170,6 +226,13 @@ class LiberoEnvFacade(BaseEnvFacade):
             }
         )
         self._readonly_methods.add("env.get_task_language")
+
+    def _dispatch_nosession(self, method: str, args: tuple, kwargs: dict) -> Any:
+        # This reader only accesses a completed render, even while chunk_step
+        # holds the exclusive environment lock and advances the simulator.
+        if method == "env.narration_frame" and self._narration_frames is not None:
+            return self._narration_frames.read(*args, **kwargs)
+        return super()._dispatch_nosession(method, args, kwargs)
 
     # ---- shape helpers ----
 
@@ -199,6 +262,8 @@ class LiberoEnvFacade(BaseEnvFacade):
 
     def reset(self):
         obs, info = self._env.reset()
+        if self._narration_frames is not None:
+            self._narration_frames.publish(obs, reset=True)
         obs = self._strip_obs(to_numpy_tree(obs))
         return obs, to_numpy_tree(info)
 
@@ -389,14 +454,17 @@ def main():
 
         torch.cuda.set_device(args.cuda_device)
 
+    narration_frames = _NarrationFrames()
     raw_env = make_env(
         args.task,
         args.seed,
         suite_name=args.suite,
         max_episode_steps=args.max_episode_steps,
+        narration_frames=narration_frames,
     )
     facade = LiberoEnvFacade(
         raw_env,
+        narration_frames=narration_frames,
         meta={
             "suite": args.suite,
             "task": args.task,

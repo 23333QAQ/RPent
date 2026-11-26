@@ -235,6 +235,10 @@ class LiberoToolkit(Toolkit):
         )
         return ToolResult(data=result)
 
+    def narration_frame(self) -> dict[str, Any] | None:
+        """Read the environment's published camera frame during robot actions."""
+        return self._primitives.env.narration_frame()
+
     def get_env_state(
         self,
         *,

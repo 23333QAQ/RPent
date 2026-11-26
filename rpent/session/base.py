@@ -175,6 +175,8 @@ class EnvState:
             with temporary.open("w") as file:
                 json.dump(manifest, file, indent=2, default=_json_default)
             os.replace(temporary, destination)
+            with self._records_lock:
+                self._last_saved_record = copy.deepcopy(self.latest_record())
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -885,12 +887,19 @@ class EnvState:
 
     # -- legacy lifecycle and counters ----------------------------------
 
+    @property
+    def output_dir(self) -> Path:
+        """Return the directory owned by this observation store."""
+        return self._output_dir
+
     def reset(self) -> None:
         """Clear legacy tool state, preserving task records and disk artifacts."""
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._steps: list[StepRecord] = []
         self._run_artifacts: set[str] = set()
         self._step_open = False
+        with self._records_lock:
+            self._last_saved_record: StepRecord | None = None
 
     @property
     def latest_step(self) -> int | None:
@@ -901,6 +910,11 @@ class EnvState:
     def latest_record(self) -> StepRecord | None:
         """Return the most recently recorded step (live reference, no copy)."""
         return self._steps[-1] if self._steps else None
+
+    def latest_saved_record(self) -> StepRecord | None:
+        """Return a snapshot of the last step published in the artifact manifest."""
+        with self._records_lock:
+            return copy.deepcopy(self._last_saved_record)
 
     def _resolve_read_step(self, step: int | None) -> int | None:
         if step is None:
@@ -1070,20 +1084,21 @@ class EnvState:
         :meth:`save` without an explicit ``step`` attaches to it. If the block
         raises, the step and any artifacts written to it are rolled back.
         """
-        if self._step_open:
-            raise RuntimeError("a step record is already open")
-        record = StepRecord(
-            step_idx=len(self._steps),
-            state=copy.deepcopy(state),
-            terminated=terminated,
-            truncated=truncated,
-            command=copy.deepcopy(command),
-            result=copy.deepcopy(result),
-            elapsed_s=elapsed_s,
-            extras=copy.deepcopy(extras or {}),
-        )
-        self._steps.append(record)
-        self._step_open = True
+        with self._artifact_lock:
+            if self._step_open:
+                raise RuntimeError("a step record is already open")
+            record = StepRecord(
+                step_idx=len(self._steps),
+                state=copy.deepcopy(state),
+                terminated=terminated,
+                truncated=truncated,
+                command=copy.deepcopy(command),
+                result=copy.deepcopy(result),
+                elapsed_s=elapsed_s,
+                extras=copy.deepcopy(extras or {}),
+            )
+            self._steps.append(record)
+            self._step_open = True
         try:
             yield record.step_idx
         except BaseException as e:
@@ -1108,8 +1123,9 @@ class EnvState:
                 raise
             raise RuntimeError(f"failed to record step {record.step_idx}: {e}") from e
         finally:
-            self._step_open = False
-            self._write_manifest()
+            with self._artifact_lock:
+                self._step_open = False
+                self._write_manifest()
 
     def get(self, step: int = -1) -> StepRecord:
         resolved_step = self._resolve_read_step(step)

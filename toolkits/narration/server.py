@@ -15,9 +15,10 @@ import argparse
 import asyncio
 import math
 import time
+from datetime import datetime
+from itertools import count
 from pathlib import Path
 from typing import Annotated, Any
-from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
@@ -53,8 +54,16 @@ def build_server(
                 raise ValueError("text must not be blank")
             started = time.perf_counter()
             audio = await tts.synthesize(text)
-            target = output_dir / f"{uuid4().hex}{getattr(tts, 'suffix', '.wav')}"
-            with target.open("xb") as stream:
+            timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f%z")
+            for index in count():
+                name = timestamp if index == 0 else f"{timestamp}_{index}"
+                target = output_dir / f"{name}{getattr(tts, 'suffix', '.wav')}"
+                try:
+                    stream = target.open("xb")
+                except FileExistsError:
+                    continue
+                break
+            with stream:
                 try:
                     stream.write(audio)
                 except OSError:

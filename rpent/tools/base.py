@@ -135,6 +135,7 @@ class Tool(Generic[ParamsT]):
     preserve_result: bool = False
     _unbound_method: bool = False
     action_source: Literal["tool_computed", "direct"] = "tool_computed"
+    background_mcp: bool = False
 
     @property
     def input_schema(self) -> dict[str, Any]:
